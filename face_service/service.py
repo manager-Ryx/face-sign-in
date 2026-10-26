@@ -1,649 +1,954 @@
-"""Named pipe server exposing face verification + credential retrieval.
+"""FaceService: the background process behind face sign-in and presence checks.
 
-Protocol: line-delimited JSON.  Client sends {"cmd": "...", ...}, server replies
-with a single JSON line and closes the connection.
+It owns the camera, the recognition model, the face profile, and the user's
+DPAPI-protected credential, and answers one JSON request per named-pipe
+connection (see :mod:`face_service.pipe`).
 
-Commands:
-  {"cmd":"ping"}
-      -> {"ok":true,"pong":true}
-  {"cmd":"verify"}
-      -> {"ok":true,"match":bool,"distance":float,"real":bool}
-  {"cmd":"unlock"}             # verify + return credentials on success
-      -> {"ok":true,"username":"...","password":"...","domain":"..."}  (on match)
-      -> {"ok":false,"reason":"..."}
-  {"cmd":"unlock_result","attempt_id":"...","accepted":true|false}
-      -> {"ok":true,"added":int}  # commit/discard staged adaptive samples
-  {"cmd":"presence"}           # single-frame presence probe
-      -> {"ok":true,"present":bool,"real":bool,"mode":"recognition|detection"}
-  {"cmd":"status"}             # service metadata for GUI
-      -> {"ok":true,"uptime_s":float,"config":{...},"enrollment":bool}
-  {"cmd":"reload_config"}      # re-read config.toml from disk
-      -> {"ok":true,"config":{...}}
-  {"cmd":"pause_camera","seconds":120}   # release webcam for N seconds so
-                                          # the enrollment GUI can own it
-      -> {"ok":true,"paused_until":float}
-  {"cmd":"resume_camera"}                 # clear the camera lease early
-      -> {"ok":true}
-  {"cmd":"build_enrollment"}              # (re)compute embeddings from ENROLL_DIR
-      -> {"ok":true,"count":int} | {"ok":false,"reason":str}
-  {"cmd":"shutdown"}           # stop the service cleanly (tray Quit uses this)
-      -> {"ok":true,"shutting_down":true}
+Commands used by the Windows sign-in tile (protocol unchanged):
+  {"cmd":"unlock"}                       -> credential on a verified face, else a reason
+  {"cmd":"unlock_result","attempt_id":..., "accepted":bool}
+
+Commands used by the tray app and tools:
+  ping, status, insights, reload_config, shutdown,
+  presence, check, verify,
+  pause_camera / renew_camera / resume_camera   (camera hand-over leases),
+  build_enrollment, profile_health, remove_anchors, map_anchor_files,
+  learning_undo, learning_reset, threshold_apply, threshold_clear,
+  snapshot_restore, camera_list, clear_measurements, low_light_reset, routine_reset.
 """
 from __future__ import annotations
-import json
+
 import logging
+import math
+import os
+import secrets
+import shutil
+import statistics
 import threading
 import time
-from dataclasses import asdict
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+from typing import Any
 
-import pywintypes  # type: ignore
-import win32api  # type: ignore
-import win32con  # type: ignore
-import win32file  # type: ignore
-import win32pipe  # type: ignore
-import win32security  # type: ignore
+import cv2
 
-
-def win32api_get_last_error() -> int:
-    return win32api.GetLastError()
-
-from .camera import Camera
-from .config import Config, LOG_PATH, PIPE_NAME
+from . import verification
+from ._version import __version__
+from .adaptation import AdaptationState
+from .camera import CameraError, list_cameras
+from .camera_manager import CameraManager, CameraSession, CameraUnavailable
+from .camera_profile import CameraProfile
+from .config import (
+    APP_DIR,
+    BACKUP_DIR,
+    CREDS_PATH,
+    ENROLL_DIR,
+    LOG_PATH,
+    METRICS_DIR,
+    PIPE_NAME,
+    STATE_DIR,
+    Config,
+    load_config,
+)
 from .credentials import load_password
 from .detector import FaceDetector
-from .recognizer import FrameAnalysis, Recognizer
+from .embedder import Embedder
+from .evaluation import evaluate_threshold
+from .evaluation_store import EvaluationStore
+from .logs import setup_logging
+from .metrics import MetricsStore
+from .pacing import LockScreenPacer
+from .pipe import ClientInfo, PipeServer
+from .profile import SOURCE_ENROLLMENT, SOURCE_MANUAL
+from .quality import assess, to_gray
+from .recognizer import IMAGE_SUFFIXES, NotEnrolledError, Outcome, Recognizer
+from .routine import ReturnRoutine
+from .verification import Verdict, VerifyPolicy
+from .win_events import SessionWatcher
 
 log = logging.getLogger(__name__)
 
-# While LogonUI is actively polling for a face, its unlock request has priority
-# over the low-frequency walk-away monitor.  A presence camera scan can take
-# long enough to make the Credential Provider abandon its pipe response.  The
-# provider refreshes this window on every unlock request; it expires shortly
-# after LogonUI stops polling so normal presence monitoring resumes.
+# While the sign-in screen is actively requesting scans, background presence
+# checks yield the camera to it.
 UNLOCK_PRIORITY_GRACE_S = 35.0
+ATTEMPT_TTL_S = 120.0
+STATUS_DEVICE_TTL_S = 10.0
+MAX_STAGING_PHOTOS = 200
+# Once a routine is known, continuous scanning after the screen locks or wakes,
+# or a face is seen, lasts this long; the routine decides beyond that.
+EAGER_WINDOW_S = 120.0
+UNLOCK_BUDGET_S = 20.0      # most a sign-in request waits before it may use the camera
+CHECK_MODEL_WAIT_S = 20.0
+# Lock-screen results that carry no news: counted per lock, not recorded one by one
+# (quick looks would otherwise write a record every few seconds all night).
+QUIET_REASONS = frozenset({"no_face", "superseded", "display-off", "stopped", "preempted",
+                           "starting"})
+PACING_REASONS = frozenset({"superseded", "display-off", "stopped", "starting"})
+CAUGHT_TEXT = {"instant": "by face straight away", "quick-look": "by face on a quick look",
+               "other": "another way"}
 
 
-def _build_pipe_sa() -> win32security.SECURITY_ATTRIBUTES:
-    """Allow only this user and LocalSystem to connect to the pipe.
+@dataclass
+class _Attempt:
+    created: float
+    eval_embedding: Any = None
+    eval_lighting: str = "unknown"
 
-    FaceService runs as the enrolled user while the credential provider runs
-    inside LogonUI as LocalSystem. No other local account needs access.
-    """
-    token = win32security.OpenProcessToken(
-        win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
-    )
-    try:
-        user_sid = win32security.GetTokenInformation(
-            token, win32security.TokenUser
-        )[0]
-    finally:
-        token.Close()
-    system_sid = win32security.ConvertStringSidToSid("S-1-5-18")
 
-    dacl = win32security.ACL()
-    access = win32con.GENERIC_READ | win32con.GENERIC_WRITE
-    dacl.AddAccessAllowedAce(win32security.ACL_REVISION, access, user_sid)
-    dacl.AddAccessAllowedAce(win32security.ACL_REVISION, access, system_sid)
-
-    sd = win32security.SECURITY_DESCRIPTOR()
-    sd.SetSecurityDescriptorOwner(user_sid, False)
-    sd.SetSecurityDescriptorDacl(True, dacl, False)
-    sa = win32security.SECURITY_ATTRIBUTES()
-    sa.SECURITY_DESCRIPTOR = sd
-    sa.bInheritHandle = 0
-    return sa
+@dataclass
+class _LockSession:
+    started: float
+    started_wall: float
+    inferred: bool = False          # the service started while the screen was already locked
+    face_seen: bool = False
+    face_accepted: bool = False
+    attempts: int = 0
+    first_face_at: float | None = None
+    accepted_at: float | None = None
+    accepted_mode: str | None = None
+    reasons: dict[str, int] = field(default_factory=dict)
 
 
 class FaceService:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, *, problems: list[str] | None = None,
+                 metrics: MetricsStore | None = None, embedder: Embedder | None = None,
+                 camera_manager: CameraManager | None = None,
+                 watcher: SessionWatcher | None = None,
+                 clock: Callable[[], float] = time.monotonic,
+                 wall_clock: Callable[[], float] = time.time):
         self.cfg = cfg
-        self.recog = Recognizer(cfg)
+        self.config_problems = list(problems or [])
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._started = time.time()
+        self.metrics = metrics or MetricsStore(METRICS_DIR / "service.jsonl",
+                                               retention_days=cfg.metrics_retention_days)
+        self.adaptation = AdaptationState(STATE_DIR / "adaptation.json")
+        self.recognizer = Recognizer(
+            cfg, embedder=embedder, metrics=self.metrics,
+            threshold=lambda: self.adaptation.effective_threshold(self.cfg))
+        self.camera_profile = CameraProfile(STATE_DIR / "camera_profile.json")
+        self.camera = camera_manager or CameraManager(lambda: self.cfg, self.camera_profile,
+                                                      self.metrics)
+        self.evaluation = EvaluationStore(STATE_DIR / "evaluation.npz")
+        self.routine = ReturnRoutine(STATE_DIR / "routine.json", clock=wall_clock)
+        self.watcher = watcher
+        self.pacer = LockScreenPacer(
+            idle_after_s=self._eager_window,
+            idle_interval_s=lambda: self.cfg.unlock_idle_interval_s,
+            pause_when_display_off=lambda: self.cfg.unlock_pause_when_display_off,
+            display_state=lambda: self.watcher.display if self.watcher else None,
+            clock=clock, likely_back=self._likely_back)
         self.detector = FaceDetector()
-        self._stop = threading.Event()
-        self._cam_lock = threading.Lock()
-        self._cam: Camera | None = None  # kept open when persistent_camera=True
-        self._unlock_camera_timer: threading.Timer | None = None
-        self._unlock_camera_expires_at = 0.0
-        self._started_at = time.time()
-        # Keep the pipe accept loop responsive while camera/model work runs.
-        # The count lets a concurrent presence probe yield the camera as soon
-        # as LogonUI starts an unlock request.
-        self._unlock_state_lock = threading.Lock()
-        self._unlock_request_count = 0
-        self._request_threads: set[threading.Thread] = set()
-        self._request_threads_lock = threading.Lock()
-        # When the enrollment wizard is running it needs exclusive access to
-        # the webcam. ``_camera_paused_until`` holds an epoch timestamp: probes
-        # and verify calls short-circuit until that time passes. The service
-        # also releases the persistent camera so the tray can open it.
-        self._camera_paused_until: float = 0.0
-        self._unlock_priority_until: float = 0.0
-        # Safe candidates from recent failed unlock votes live only in memory.
-        # They are eligible for persistence only if a later face attempt is
-        # accepted by Windows, and are bounded by the config TTL/cap.
-        self._preauth_candidates: list[tuple[float, FrameAnalysis]] = []
+        self.server: PipeServer | None = None
+        self._unlock_priority_until = 0.0
+        self._attempts: dict[str, _Attempt] = {}
+        self._attempts_lock = threading.Lock()
+        self._lock_session: _LockSession | None = None
+        self._session_lock = threading.Lock()
+        self._device_status: tuple[float, dict] | None = None
+        self._ready_reason = "starting"
+        self._warm = threading.Event()
+        self._warm.set()  # cleared by start_warmup() until the model is loaded
+        self._stopping = threading.Event()
+        if watcher is not None:
+            watcher.add_handler(self._on_session_event)
 
-    def _begin_unlock_request(self) -> None:
-        with self._unlock_state_lock:
-            self._unlock_request_count += 1
+    # ---- session events ----------------------------------------------------
 
-    def _end_unlock_request(self) -> None:
-        with self._unlock_state_lock:
-            self._unlock_request_count = max(0, self._unlock_request_count - 1)
+    def _on_session_event(self, name: str, detail: dict) -> None:
+        self.metrics.record("session_event", event=name, **{k: v for k, v in detail.items()
+                                                            if isinstance(v, (str, int))})
+        if name.startswith("display-"):
+            self.pacer.display_changed(name.split("-", 1)[1])
+        elif name == "lock":
+            with self._session_lock:
+                self._lock_session = _LockSession(self._clock(), self._wall_clock())
+            self.pacer.take_mode_time()  # start this lock's camera-time tally afresh
+            self.camera.release_now()
+        elif name == "unlock":
+            self._close_lock_session()
+
+    def _close_lock_session(self) -> None:
+        with self._session_lock:
+            session, self._lock_session = self._lock_session, None
+        spent = self.pacer.take_mode_time()
+        if session is None:
+            return
+        away_s = self._clock() - session.started
+        time_to_unlock = (session.accepted_at - session.first_face_at
+                          if session.accepted_at and session.first_face_at else None)
+        if session.face_accepted:
+            caught = "instant" if session.accepted_mode == "active" else "quick-look"
+        else:
+            caught = "other"
+        self.metrics.record(
+            "lock_session", duration_s=away_s, face_seen=session.face_seen,
+            face_accepted=session.face_accepted, attempts=session.attempts,
+            time_to_unlock_s=time_to_unlock, caught=caught,
+            scanning_s=round(spent.get("active", 0.0), 1),
+            quick_look_s=round(spent.get("idle", 0.0), 1),
+            screen_off_s=round(spent.get("display-off", 0.0), 1),
+            top_reason=max(session.reasons, key=session.reasons.get) if session.reasons else "")
+        log.info("lock screen: away %.0f min, %d look(s), signed in %s", away_s / 60.0,
+                 session.attempts, CAUGHT_TEXT[caught])
+        if self.cfg.unlock_learn_routine and not session.inferred:
+            known = self.routine.schedule() is not None
+            self.routine.observe(session.started_wall, self._wall_clock())
+            if not known and self.routine.schedule() is not None:
+                self.adaptation.note("routine", None, "learned",
+                                     "The sign-in screen now scans when you usually come back",
+                                     by="automatic")
+        if session.face_seen:
+            result = self.adaptation.record_session(face_success=session.face_accepted)
+            if result and result.get("rolled_back"):
+                log.warning("automatic threshold change rolled back (rate %.0f%%)",
+                            result["rate"] * 100)
+
+    def _note_attempt(self, verdict: Verdict | None, reason: str, mode: str,
+                      looked_at: float | None = None) -> None:
+        """Tally one sign-in screen request; ``looked_at`` is when its camera look began."""
+        with self._session_lock:
+            session = self._lock_session
+            if session is None or reason in PACING_REASONS:
+                return
+            session.attempts += 1
+            session.reasons[reason] = session.reasons.get(reason, 0) + 1
+            if verdict and any(f.outcome is not Outcome.NO_FACE for f in verdict.frames):
+                session.face_seen = True
+                if session.first_face_at is None:
+                    session.first_face_at = looked_at if looked_at is not None else self._clock()
+                if verdict.accepted and session.accepted_at is None:
+                    session.accepted_at = self._clock()
+                    session.accepted_mode = mode
+
+    def _ensure_lock_session(self) -> None:
+        """Time the rest of a lock that began before the service started."""
+        if self._lock_session is not None or self.watcher is None or not self.watcher.locked:
+            return
+        with self._session_lock:
+            if self._lock_session is None:
+                self._lock_session = _LockSession(self._clock(), self._wall_clock(),
+                                                  inferred=True)
+
+    # ---- lock-screen routine -------------------------------------------------
+
+    def _routine_in_use(self) -> bool:
+        return self.cfg.unlock_learn_routine and self.routine.schedule() is not None
+
+    def _eager_window(self) -> float:
+        """Continuous scanning after the screen locks or wakes, or a face is seen."""
+        if self._routine_in_use():
+            return min(EAGER_WINDOW_S, self.cfg.unlock_idle_after_s)
+        return self.cfg.unlock_idle_after_s
+
+    def _likely_back(self) -> bool:
+        """The learned routine says you're probably back soon: keep scanning."""
+        if not self.cfg.unlock_learn_routine:
+            return False
+        session = self._lock_session
+        locked_at = None if session is None or session.inferred else session.started_wall
+        return self.routine.likely_back(self._wall_clock(), locked_at)
+
+    def _model_ready(self, wait_s: float) -> bool:
+        """Wait (bounded) for start-up loading, so the camera never waits on the model."""
+        if not self._warm.wait(max(0.0, wait_s)):
+            return False
+        self.recognizer.embedder.load()  # no-op unless the start-up warm-up is turned off
+        return True
+
+    # ---- helpers -----------------------------------------------------------
+
+    @property
+    def threshold(self) -> float:
+        return self.adaptation.effective_threshold(self.cfg)
 
     def _unlock_priority_active(self) -> bool:
-        with self._unlock_state_lock:
-            active = self._unlock_request_count > 0
-        return active or time.monotonic() < self._unlock_priority_until
+        return self._clock() < self._unlock_priority_until or self.camera.unlock_waiting()
 
-    def _prune_preauth_candidates(self) -> None:
-        """Drop expired/disabled pre-auth candidates."""
-        if (
-            not self.cfg.adaptive_enrollment
-            or not self.cfg.adaptive_pre_auth_enabled
-            or self.cfg.adaptive_pre_auth_max_frames <= 0
-            or self.cfg.adaptive_pre_auth_ttl_s <= 0
-        ):
-            self._preauth_candidates.clear()
+    def _credentials_caller_ok(self, client: ClientInfo) -> bool:
+        mode = self.cfg.unlock_client_check
+        if mode == "off":
+            return True
+        self.metrics.record("unlock_caller", system=client.is_system,
+                            identified=client.sid is not None)
+        if client.is_system:
+            return True
+        log.warning("credential request from a non-system caller (pid=%s)", client.pid)
+        return mode != "enforce"
+
+    def _observe_lighting(self, verdict: Verdict) -> str | None:
+        face = next((f for f in verdict.frames if f.quality and f.outcome is not Outcome.NO_FACE),
+                    None)
+        if face is None or face.quality is None:
+            return None
+        self.camera_profile.observe_lighting(face.quality.lighting, face.quality.face_brightness)
+        return face.quality.lighting
+
+    @staticmethod
+    def _frame_summary(verdict: Verdict) -> list[dict]:
+        return [{"outcome": f.outcome.value,
+                 "distance": round(f.distance, 4) if f.outcome not in (
+                     Outcome.NO_FACE, Outcome.SPOOF) else None,
+                 "issue": f.issue,
+                 "face_brightness": round(f.quality.face_brightness, 1)
+                 if f.quality and math.isfinite(f.quality.face_brightness) else None}
+                for f in verdict.frames]
+
+    def _record_attempt(self, kind: str, verdict: Verdict | None, *, reason: str,
+                        session: CameraSession | None = None, extra: dict | None = None) -> None:
+        data: dict[str, Any] = {"reason": reason}
+        if verdict is not None:
+            data.update(frames=len(verdict.frames), matches=verdict.counted_matches,
+                        best=round(verdict.best_distance, 4), verify_ms=verdict.elapsed_ms,
+                        issue=verdict.issue or "",
+                        outcomes=[f.outcome.value for f in verdict.frames])
+            face = next((f for f in verdict.frames if f.quality and f.face_count), None)
+            if face is not None and face.quality is not None:
+                data.update(face_brightness=face.quality.face_brightness,
+                            lighting=face.quality.lighting)
+        if session is not None:
+            data.update(settle_ms=session.settle.ms, settle_frames=session.settle.frames,
+                        fps=session.camera.fps or 0)
+        data["threshold"] = self.threshold
+        if extra:
+            data.update(extra)
+        self.metrics.record(kind, **data)
+
+    def _verify(self, session: CameraSession, policy: VerifyPolicy, *,
+                preempted: Callable[[], bool] | None = None) -> Verdict:
+        verdict = verification.run(
+            session, self.recognizer, policy, threshold=self.threshold,
+            first_frame=session.first_frame, preempted=preempted or session.preempted,
+            keep_crops=self.cfg.adaptive_keep_photos)
+        lighting = self._observe_lighting(verdict)
+        # In dim light a lower frame rate lets the camera expose longer. Use
+        # it within this attempt only once it has proven useful here.
+        dark = verdict.issue in ("too_dark", "no_face", "unusable", "uncertain")
+        if (not verdict.accepted and dark and lighting in ("dim", "dark", "backlit")
+                and self.cfg.camera_low_light_fps and not session.camera.fps
+                and self.camera_profile.low_light_state() == "enabled"):
+            session.switch_to_low_light()
+            retry = verification.run(
+                session, self.recognizer, policy, threshold=self.threshold,
+                first_frame=session.first_frame, preempted=preempted or session.preempted,
+                keep_crops=self.cfg.adaptive_keep_photos)
+            retry.frames = verdict.frames + retry.frames
+            verdict = retry
+        return verdict
+
+    def _trial_low_light(self, session: CameraSession, verdict: Verdict) -> None:
+        """Background-only experiment: does a lower frame rate brighten your face?"""
+        lighting = self._observe_lighting(verdict)
+        if not (lighting and self.cfg.camera_low_light_fps
+                and self.camera_profile.should_trial_low_light(lighting)
+                and not session.camera.fps):
             return
-        cutoff = time.monotonic() - self.cfg.adaptive_pre_auth_ttl_s
-        self._preauth_candidates = [
-            item for item in self._preauth_candidates if item[0] >= cutoff
-        ]
-        if len(self._preauth_candidates) > self.cfg.adaptive_pre_auth_max_frames:
-            self._preauth_candidates = self._preauth_candidates[
-                -self.cfg.adaptive_pre_auth_max_frames :
-            ]
-
-    def _remember_preauth_candidates(self, analyses: list[FrameAnalysis]) -> None:
-        """Retain only safe in-memory candidates from a failed vote."""
-        self._prune_preauth_candidates()
-        if not analyses:
+        before = [f.quality.face_brightness for f in verdict.frames
+                  if f.quality and math.isfinite(f.quality.face_brightness)]
+        if not before:
             return
-        if (
-            not self.cfg.adaptive_enrollment
-            or not self.cfg.adaptive_pre_auth_enabled
-        ):
+        cost = session.switch_to_low_light()
+        if cost is None:
             return
-        now = time.monotonic()
-        self._preauth_candidates.extend((now, analysis) for analysis in analyses)
-        self._prune_preauth_candidates()
+        after = []
+        for _ in range(4):
+            frame = session.read_frame()
+            box = self.detector.detect_largest(frame)
+            if box is not None:
+                quality = assess(to_gray(frame), box)
+                if math.isfinite(quality.face_brightness):
+                    after.append(quality.face_brightness)
+        if after:
+            self.camera_profile.observe_fps_switch(statistics.median(before),
+                                                   statistics.median(after), cost)
+            self.metrics.record("low_light_trial", before=statistics.median(before),
+                                after=statistics.median(after), cost_ms=cost)
 
-    def _consume_preauth_candidates(
-        self, current: list[FrameAnalysis]
-    ) -> list[FrameAnalysis]:
-        """Combine recent failed-vote candidates with the successful vote."""
-        self._prune_preauth_candidates()
-        previous = [analysis for _created, analysis in self._preauth_candidates]
-        self._preauth_candidates.clear()
-        return previous + current
+    # ---- core commands ------------------------------------------------------
 
-    def _camera_leased_out(self) -> bool:
-        return time.time() < self._camera_paused_until
+    def unlock(self, client: ClientInfo) -> dict:
+        if not self._credentials_caller_ok(client):
+            return {"ok": False, "reason": "caller-not-allowed"}
+        started = self._clock()
+        self._unlock_priority_until = started + UNLOCK_PRIORITY_GRACE_S
+        self._ensure_lock_session()
+        ticket = self.pacer.begin()
+        face_seen = False
+        verdict: Verdict | None = None
+        session_ref: CameraSession | None = None
+        mode = "none"
+        reason = "error"
+        looked_at: float | None = None
+        try:
+            turn = self.pacer.wait_turn(ticket)
+            if turn != "go":
+                reason = turn
+                return {"ok": False, "reason": turn}
+            self.recognizer.require_profile()
+            if not self._model_ready(UNLOCK_BUDGET_S - (self._clock() - started)):
+                reason = "starting"
+                return {"ok": False, "reason": "starting"}
+            mode = self.pacer.mode
+            policy = VerifyPolicy.for_unlock(self.cfg)
+            if mode == "idle":
+                # A quick look: one frame; a full attempt only if someone is there.
+                policy = replace(policy, max_no_face=1)
+            looked_at = self._clock()
+            with self.camera.session("unlock", wait_s=8.0) as session:
+                session_ref = session
+                verdict = self._verify(session, policy, preempted=lambda: (
+                    self.pacer.generation != ticket.generation))
+                face_seen = any(f.outcome is not Outcome.NO_FACE for f in verdict.frames)
+                session.release_after = (0.0 if verdict.accepted or mode != "active"
+                                         else self.camera.hold_seconds())
+            reason = verdict.reason
+            if not verdict.accepted:
+                return {"ok": False, "reason": verdict.reason, "guidance": verdict.issue,
+                        "distance": round(verdict.best_distance, 4)}
+            credential = load_password()
+            if not credential:
+                reason = "no-credentials"
+                return {"ok": False, "reason": "no-credentials"}
+            attempt_id = secrets.token_urlsafe(18)
+            self.recognizer.stage_learning(verdict.frames, attempt_id=attempt_id)
+            self._remember_attempt(attempt_id, verdict)
+            return {"ok": True, "username": credential["u"], "password": credential["p"],
+                    "domain": credential.get("d", "."), "attempt_id": attempt_id}
+        except NotEnrolledError:
+            reason = "not-enrolled"
+            return {"ok": False, "reason": "not-enrolled"}
+        except CameraUnavailable as exc:
+            reason = exc.reason
+            return {"ok": False, "reason": exc.reason}
+        except CameraError as exc:
+            reason = f"camera-{exc.kind}"
+            return {"ok": False, "reason": reason, "message": str(exc)}
+        finally:
+            self.pacer.end(face_seen=face_seen)
+            self._note_attempt(verdict, reason, mode, looked_at)
+            if face_seen or reason not in QUIET_REASONS:
+                self._record_attempt("unlock_attempt", verdict, reason=reason,
+                                     session=session_ref,
+                                     extra={"mode": mode, "caller_system": client.is_system,
+                                            "interactive": ticket.interactive})
 
-    def _get_camera(self) -> Camera:
-        """Return the shared persistent camera, opening it if needed."""
-        if self._cam is None:
-            self._cam = Camera.from_config(self.cfg)
-            self._cam.open()
-        return self._cam
+    def _remember_attempt(self, attempt_id: str, verdict: Verdict) -> None:
+        # Keep one spare matching frame (not the learned one) as evaluation data.
+        spare = [f for f in verdict.frames if f.match and f.embedding is not None]
+        eval_frame = spare[-1] if len(spare) >= 2 else None
+        now = self._clock()
+        with self._attempts_lock:
+            for key in [k for k, v in self._attempts.items() if now - v.created > ATTEMPT_TTL_S]:
+                self._attempts.pop(key, None)
+            self._attempts[attempt_id] = _Attempt(
+                now, eval_frame.embedding if eval_frame else None,
+                eval_frame.quality.lighting if eval_frame and eval_frame.quality else "unknown")
 
-    def _release_camera(self) -> None:
-        if self._cam is not None:
-            self._cam.close()
-            self._cam = None
+    def unlock_result(self, attempt_id: Any, accepted: Any) -> dict:
+        if not isinstance(attempt_id, str) or not isinstance(accepted, bool):
+            return {"ok": False, "reason": "invalid-unlock-result"}
+        with self._attempts_lock:
+            attempt = self._attempts.pop(attempt_id, None)
+        result = self.recognizer.finish_learning(attempt_id, accepted)
+        if attempt is None:
+            log.info("unlock result for an unknown, expired, or repeated attempt ignored")
+            return {"ok": True, "added": 0}
+        if accepted:
+            with self._session_lock:
+                if self._lock_session is not None:
+                    self._lock_session.face_accepted = True
+            if attempt.eval_embedding is not None:
+                self.evaluation.add([attempt.eval_embedding], source="unlock",
+                                    lighting=[attempt.eval_lighting],
+                                    session=secrets.token_hex(6))
+        self.metrics.record("unlock_result", accepted=accepted, added=result.added,
+                            reason=result.reason)
+        log.info("face sign-in result accepted=%s learned=%d (%s)", accepted, result.added,
+                 result.reason)
+        return {"ok": True, "added": result.added}
 
-    def _cancel_unlock_camera_release(self) -> None:
-        timer = self._unlock_camera_timer
-        self._unlock_camera_timer = None
-        self._unlock_camera_expires_at = 0.0
-        if timer is not None:
-            timer.cancel()
-
-    def _schedule_unlock_camera_release(self) -> None:
-        """Keep the camera warm only across active lock-screen retries."""
-        if self.cfg.persistent_camera:
-            return
-        self._cancel_unlock_camera_release()
-        hold_s = self.cfg.unlock_camera_hold_s
-        if hold_s <= 0:
-            self._release_camera()
-            return
-        self._unlock_camera_expires_at = time.monotonic() + hold_s
-
-        def release_if_idle() -> None:
-            with self._cam_lock:
-                if time.monotonic() >= self._unlock_camera_expires_at:
-                    self._release_camera()
-                    self._unlock_camera_timer = None
-                    self._unlock_camera_expires_at = 0.0
-
-        self._unlock_camera_timer = threading.Timer(hold_s + 0.05, release_if_idle)
-        self._unlock_camera_timer.daemon = True
-        self._unlock_camera_timer.start()
-
-    # ---------- core ops ----------
-
-    def _capture_and_verify(
-        self, *, for_unlock: bool = False
-    ) -> tuple[bool, float, bool, list]:
-        if self._camera_leased_out():
-            log.info("verify skipped: camera leased out to enrollment")
-            return False, 1.0, False, []
-        matches = 0
-        best = 1.0
-        real_seen = False
-        adaptive_candidates = []
-        frames = self.cfg.unlock_verify_frames if for_unlock else self.cfg.verify_frames
-        required = self.cfg.unlock_verify_required if for_unlock else self.cfg.verify_required
-        with self._cam_lock:
-            # Unlock retries share a short-lived warm camera even when normal
-            # presence probes release it after every request.
-            warm_unlock = for_unlock and self.cfg.unlock_camera_hold_s > 0
-            cam = self._get_camera() if (self.cfg.persistent_camera or warm_unlock) else Camera.from_config(self.cfg)
-            if not self.cfg.persistent_camera and not warm_unlock:
-                cam.open()
-            try:
-                # drain stale buffered frames
-                for _ in range(2):
-                    cam.read()
-                for _ in range(frames):
-                    frame = cam.read()
-                    if frame is None:
-                        continue
-                    try:
-                        analysis = self.recog.analyze_frame(frame)
-                    except Exception as e:
-                        log.warning("verify error: %s", e)
-                        continue
-                    ok, dist, real = analysis.match, analysis.distance, analysis.is_real
-                    real_seen = real_seen or real
-                    if dist < best:
-                        best = dist
-                    if for_unlock and analysis.adaptive_eligible:
-                        adaptive_candidates.append(analysis)
-                    if ok:
-                        matches += 1
-                        if matches >= required:
-                            return True, best, True, adaptive_candidates
-            finally:
-                if warm_unlock:
-                    self._schedule_unlock_camera_release()
-                elif not self.cfg.persistent_camera:
-                    cam.close()
-        return False, best, real_seen, adaptive_candidates
-
-    def _presence_probe(self) -> tuple[bool, bool]:
-        """(present, real) — semantics depend on config.presence_mode.
-
-        recognition: ``present`` = enrolled face detected AND passes anti-spoofing.
-        detection:   ``present`` = *any* face detected by YuNet. ``real`` is
-                     reported as True (anti-spoofing not evaluated).
-        """
-        if self._camera_leased_out():
-            log.info("presence probe skipped: camera leased out to enrollment")
-            # Return (True, True) so the monitor doesn't rack up strikes
-            # while the user is enrolling their face.
-            return True, True
-        if self.cfg.presence_mode == "detection":
-            return self._presence_probe_detection()
-        return self._presence_probe_recognition()
-
-    def _presence_probe_recognition(self) -> tuple[bool, bool]:
+    def presence(self) -> dict:
+        mode = self.cfg.presence_mode
+        if self.camera.leased_to():
+            return {"ok": True, "present": True, "skipped": "camera-leased", "mode": mode}
         if self._unlock_priority_active():
-            return True, True
-        with self._cam_lock:
-            if self._unlock_priority_active():
-                return True, True
-            cam = self._get_camera() if self.cfg.persistent_camera else Camera.from_config(self.cfg)
-            if not self.cfg.persistent_camera:
-                cam.open()
-            try:
-                for _ in range(2):
-                    if self._unlock_priority_active():
-                        return True, True
-                    cam.read()
-                for _ in range(3):
-                    if self._unlock_priority_active():
-                        return True, True
-                    frame = cam.read()
-                    if frame is None:
-                        continue
-                    try:
-                        ok, _dist, real = self.recog.verify_frame(frame)
-                    except Exception:
-                        continue
-                    if ok:
-                        return True, real
-            finally:
-                if not self.cfg.persistent_camera:
-                    cam.close()
-        return False, False
+            return {"ok": True, "present": True, "skipped": "unlock-active", "mode": mode}
+        if (self.cfg.presence_pause_while_locked and self.watcher is not None
+                and self.watcher.locked):
+            return {"ok": True, "present": True, "skipped": "locked", "mode": mode}
+        verdict: Verdict | None = None
+        try:
+            if mode != "detection":
+                self.recognizer.require_profile()  # before the camera turns on
+                if not self._model_ready(0.0):  # never hold the camera while the model loads
+                    return {"ok": True, "present": True, "skipped": "starting", "mode": mode}
+            with self.camera.session("presence", wait_s=2.0) as session:
+                if mode == "detection":
+                    present = self._detect_any_face(session)
+                    self.metrics.record("presence_check", reason="face" if present
+                                        else "no_face", mode=mode)
+                    return {"ok": True, "present": present, "mode": mode}
+                verdict = self._verify(session, VerifyPolicy.for_presence(self.cfg))
+                if verdict.reason == "preempted":
+                    return {"ok": True, "present": True, "skipped": "unlock-active", "mode": mode}
+                self._record_attempt("presence_check", verdict, reason=verdict.reason,
+                                     session=session)
+                self._trial_low_light(session, verdict)
+        except NotEnrolledError:
+            return {"ok": False, "reason": "not-enrolled"}
+        except CameraUnavailable as exc:
+            return {"ok": True, "present": True, "skipped": exc.reason, "mode": mode}
+        except CameraError as exc:
+            return {"ok": False, "reason": f"camera-{exc.kind}", "message": str(exc)}
+        return {"ok": True, "present": verdict.accepted, "mode": mode, "outcome": verdict.reason,
+                "guidance": verdict.issue, "distance": round(verdict.best_distance, 4)}
 
-    def _presence_probe_detection(self) -> tuple[bool, bool]:
-        if self._unlock_priority_active():
-            return True, True
-        with self._cam_lock:
-            if self._unlock_priority_active():
-                return True, True
-            cam = self._get_camera() if self.cfg.persistent_camera else Camera.from_config(self.cfg)
-            if not self.cfg.persistent_camera:
-                cam.open()
-            try:
-                for _ in range(2):
-                    if self._unlock_priority_active():
-                        return True, True
-                    cam.read()
-                for _ in range(5):
-                    if self._unlock_priority_active():
-                        return True, True
-                    frame = cam.read()
-                    if frame is None:
-                        continue
-                    try:
-                        if self.detector.has_face(frame):
-                            return True, True
-                    except Exception as e:
-                        log.warning("detector error: %s", e)
-                        continue
-            finally:
-                if not self.cfg.persistent_camera:
-                    cam.close()
-        return False, True
+    def _detect_any_face(self, session: CameraSession) -> bool:
+        frame = session.first_frame
+        for _ in range(5):
+            if frame is not None and self.detector.has_face(frame):
+                return True
+            frame = session.read_frame()
+        return False
 
-    # ---------- pipe ----------
+    def check(self, *, record: bool) -> dict:
+        """A recognition test the signed-in user runs from the app."""
+        try:
+            self.recognizer.require_profile()
+            if not self._model_ready(CHECK_MODEL_WAIT_S):
+                return {"ok": False, "reason": "starting",
+                        "message": "Face Unlock is still starting. Try again in a moment."}
+            with self.camera.session("check", wait_s=5.0) as session:
+                verdict = self._verify(session, VerifyPolicy.for_check(self.cfg),
+                                       preempted=lambda: False)
+                open_ms = (session.camera.report.open_ms if session.camera.report else 0.0)
+        except NotEnrolledError:
+            return {"ok": False, "reason": "not-enrolled"}
+        except CameraUnavailable as exc:
+            return {"ok": False, "reason": exc.reason, "message": str(exc)}
+        except CameraError as exc:
+            return {"ok": False, "reason": f"camera-{exc.kind}", "message": str(exc)}
+        faces = [f for f in verdict.frames if f.embedding is not None and f.quality
+                 and f.quality.usable]
+        if record and faces:
+            self.evaluation.add([f.embedding for f in faces], source="check",
+                                lighting=[f.quality.lighting for f in faces],  # type: ignore[union-attr]
+                                session=secrets.token_hex(6))
+        self._record_attempt("check", verdict, reason=verdict.reason)
+        return {"ok": True, "accepted": verdict.accepted, "reason": verdict.reason,
+                "guidance": verdict.issue, "threshold": round(self.threshold, 4),
+                "frames": self._frame_summary(verdict), "verify_ms": round(verdict.elapsed_ms),
+                "camera_open_ms": round(open_ms), "recorded": bool(record and faces)}
 
-    def _status(self) -> dict:
-        from .config import EMBED_PATH
-        protected_count, adaptive_count = self.recog.profile_counts()
+    # ---- enrollment ----------------------------------------------------------
+
+    def _staging_dir(self, name: Any) -> Path:
+        if not isinstance(name, str) or not name or "/" in name or "\\" in name or ".." in name:
+            raise ValueError("invalid staging folder")
+        path = APP_DIR / "staging" / name
+        if not path.is_dir():
+            raise ValueError("staging folder not found")
+        return path
+
+    def build_enrollment(self, request: dict) -> dict:
+        mode = request.get("mode", "replace")
+        dry_run = bool(request.get("dry_run", False))
+        staging = request.get("staging")
+        if staging:
+            folder = self._staging_dir(staging)
+        else:
+            folder = ENROLL_DIR
+        photos = sorted(p for p in folder.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+        if not photos:
+            return {"ok": False, "reason": "no-photos"}
+        if len(photos) > MAX_STAGING_PHOTOS:
+            return {"ok": False, "reason": "too-many-photos"}
+        source = SOURCE_MANUAL if mode == "append" else SOURCE_ENROLLMENT
+        holdout = 0 if dry_run or not staging else 7
+        try:
+            report = self.recognizer.build_profile(photos, mode=mode, source=source,
+                                                   dry_run=dry_run, holdout_every=holdout)
+        except ValueError as exc:
+            return {"ok": False, "reason": "no-usable-face", "message": str(exc)}
+        if not dry_run and staging:
+            self._commit_staging(folder, mode, {r.name for r in report.results if r.accepted})
+            if report.holdout:
+                self.evaluation.add([e for e, _ in report.holdout], source="holdout",
+                                    lighting=[light for _, light in report.holdout],
+                                    session=secrets.token_hex(6))
+            self.adaptation.note("enrollment", None, f"{mode}: {report.accepted} photos",
+                                 "You saved a new face profile" if mode == "replace"
+                                 else "You added your current appearance", by="you")
+        return {"ok": True, "mode": mode, "dry_run": dry_run, "accepted": report.accepted,
+                "rejected": report.rejected, "anchors": report.anchors,
+                "learned": report.learned, "consistency": report.consistency,
+                "results": [asdict(r) for r in report.results][:MAX_STAGING_PHOTOS]}
+
+    def _commit_staging(self, folder: Path, mode: str, accepted: set[str]) -> None:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        ENROLL_DIR.mkdir(parents=True, exist_ok=True)
+        if mode == "replace":
+            backup = BACKUP_DIR / f"enroll-{stamp}"
+            backup.mkdir(parents=True, exist_ok=True)
+            for old in ENROLL_DIR.iterdir():
+                if old.is_file():
+                    shutil.move(str(old), backup / old.name)
+        for photo in folder.iterdir():
+            if photo.name in accepted:
+                shutil.move(str(photo), ENROLL_DIR / photo.name)
+        shutil.rmtree(folder, ignore_errors=True)
+
+    # ---- status & insights ----------------------------------------------------
+
+    def _device(self) -> dict:
+        now = self._clock()
+        cached = self._device_status
+        if cached is None or now - cached[0] > STATUS_DEVICE_TTL_S:
+            cached = (now, self.camera.probe_device())
+            self._device_status = cached
+        return cached[1]
+
+    def status(self) -> dict:
+        anchors, learned = self.recognizer.profile_counts()
+        device = self._device()
+        camera = {"device": device, "activity": self.camera.status()}
+        reasons = []
+        if anchors == 0:
+            reasons.append("not-enrolled")
+        if not CREDS_PATH.exists():
+            reasons.append("no-credentials")
+        if device.get("state") != "ready":
+            reasons.append(f"camera-{device.get('state')}")
+        ready = not reasons
+        profile = self.recognizer.profile
+        last_learned = None
+        if profile is not None and profile.learned_count:
+            last_learned = float(profile.created_at[profile.protected_count:].max())
         return {
-            "ok": True,
-            "uptime_s": time.time() - self._started_at,
-            "config": asdict(self.cfg),
-            "enrollment": EMBED_PATH.exists(),
-            "profile": {
-                "protected": protected_count,
-                "adaptive": adaptive_count,
-            },
+            "ok": True, "version": __version__, "pid": os.getpid(),
+            "uptime_s": round(time.time() - self._started, 1),
+            "ready": ready, "not_ready": reasons, "warming": self._ready_reason,
+            "config_problems": self.config_problems,
+            "profile": {"anchors": anchors, "learned": learned},
+            "camera": camera,
+            "recognition": {"threshold": self.cfg.threshold,
+                            "effective": round(self.threshold, 4),
+                            "anti_spoofing": self.cfg.anti_spoofing,
+                            "model": self.cfg.model_name, "strategy": self.cfg.unlock_strategy,
+                            "model_loaded": self.recognizer.embedder.loaded,
+                            "compiled": self.recognizer.embedder.compiled_ok},
+            "learning": {"enabled": self.cfg.adaptive_enrollment, "last": last_learned},
+            "credentials": CREDS_PATH.exists(),
+            "lock_screen": {"mode": self.pacer.mode,
+                            "display": self.watcher.display if self.watcher else None,
+                            "locked": self.watcher.locked if self.watcher else None,
+                            "routine": ("off" if not self.cfg.unlock_learn_routine
+                                        else "in-use" if self._routine_in_use()
+                                        else "learning")},
         }
 
-    def _reload_config(self) -> dict:
-        new_cfg = Config.load()
+    def insights(self, days: float = 30.0) -> dict:
+        from .insights import build_insights
+        return build_insights(self, days=days)
+
+    # ---- request dispatch ----------------------------------------------------
+
+    def handle(self, request: dict, client: ClientInfo) -> dict:
+        cmd = request.get("cmd")
+        if cmd not in ("ping", "status"):
+            log.info("request cmd=%s", cmd)
+        handler = self._handlers().get(cmd)
+        if handler is None:
+            return {"ok": False, "reason": "unknown-command"}
+        return handler(request, client)
+
+    def _handlers(self) -> dict[str, Callable[[dict, ClientInfo], dict]]:
+        return {
+            "ping": lambda r, c: {"ok": True, "pong": True},
+            "status": lambda r, c: self.status(),
+            "insights": lambda r, c: {"ok": True, **self.insights(float(r.get("days", 30)))},
+            "reload_config": lambda r, c: self.reload_config(),
+            "shutdown": lambda r, c: self.shutdown(),
+            "unlock": lambda r, c: self.unlock(c),
+            "unlock_result": lambda r, c: self.unlock_result(r.get("attempt_id"),
+                                                             r.get("accepted")),
+            "presence": lambda r, c: self.presence(),
+            "check": lambda r, c: self.check(record=bool(r.get("record", True))),
+            "verify": lambda r, c: self._legacy_verify(),
+            "pause_camera": lambda r, c: {"ok": True, "lease_s": self.camera.lease(
+                str(r.get("owner", "enrollment")), float(r.get("seconds", 120)))},
+            "renew_camera": lambda r, c: {"ok": self.camera.renew(
+                str(r.get("owner", "enrollment")), float(r.get("seconds", 120)))},
+            "resume_camera": lambda r, c: {"ok": True, "ended": self.camera.end_lease(
+                r.get("owner"))},
+            "build_enrollment": lambda r, c: self.build_enrollment(r),
+            "profile_health": lambda r, c: {"ok": True, **self.recognizer.profile_health()},
+            "map_anchor_files": lambda r, c: {"ok": True,
+                                              "mapped": self.recognizer.map_anchor_files()},
+            "remove_anchors": lambda r, c: self._remove_anchors(r),
+            "learning_undo": lambda r, c: self._learning_undo(r),
+            "learning_reset": lambda r, c: self._learning_reset(),
+            "threshold_apply": lambda r, c: self._threshold_apply(r),
+            "threshold_clear": lambda r, c: self._threshold_clear(),
+            "snapshot_take": lambda r, c: {"ok": True, "snapshot": self.adaptation.take_snapshot(
+                self.cfg, str(r.get("label", "Saved by you"))[:80])},
+            "snapshot_restore": lambda r, c: self._snapshot_restore(r),
+            "camera_list": lambda r, c: self._camera_list(),
+            "clear_measurements": lambda r, c: self._clear_measurements(),
+            "low_light_reset": lambda r, c: self._low_light_reset(),
+            "routine_reset": lambda r, c: self._routine_reset(),
+        }
+
+    def _legacy_verify(self) -> dict:
+        result = self.check(record=False)
+        if not result.get("ok"):
+            return result
+        distances = [f["distance"] for f in result["frames"] if f["distance"] is not None]
+        return {"ok": True, "match": result["accepted"],
+                "distance": min(distances) if distances else 1.0, "real": True,
+                "frames": len(result["frames"]), "verify_ms": result["verify_ms"]}
+
+    def _remove_anchors(self, request: dict) -> dict:
+        indices = request.get("indices")
+        if not isinstance(indices, list) or not all(isinstance(i, int) for i in indices):
+            return {"ok": False, "reason": "invalid-indices"}
+        removed = self.recognizer.remove_anchors(indices)
+        files = [name for name in removed if name]
+        if files:
+            # Keep the photos (out of the enrollment folder) so the removal can be undone.
+            backup = BACKUP_DIR / f"removed-photos-{time.strftime('%Y%m%d-%H%M%S')}"
+            backup.mkdir(parents=True, exist_ok=True)
+            for name in files:
+                source = ENROLL_DIR / name
+                if source.exists():
+                    shutil.move(str(source), backup / name)
+        if removed:
+            self.adaptation.note("enrollment", None, f"removed {len(removed)} photo(s)",
+                                 "You removed reference photos", by="you")
+        return {"ok": True, "removed": len(removed)}
+
+    def _learning_undo(self, request: dict) -> dict:
+        since = request.get("since")
+        ids = request.get("ids")
+        removed = self.recognizer.undo_learning(
+            since=float(since) if isinstance(since, (int, float)) else None,
+            sample_ids=ids if isinstance(ids, list) else None)
+        if removed:
+            self.adaptation.note("learning", None, f"undid {removed} sample(s)",
+                                 "You undid recent learning", by="you")
+        return {"ok": True, "removed": removed}
+
+    def _learning_reset(self) -> dict:
+        removed = self.recognizer.reset_learning()
+        self.adaptation.note("learning", None, "reset",
+                             f"You reset learned data ({removed} samples); original enrollment kept",
+                             by="you")
+        return {"ok": True, "removed": removed}
+
+    def _threshold_report(self):
+        profile = self.recognizer.profile
+        if profile is None:
+            return None
+        return evaluate_threshold(
+            self.evaluation.samples(profile), current=self.threshold,
+            baseline=self.cfg.threshold, sequences=self.evaluation.sequences(profile),
+            required=self.cfg.unlock_verify_required, max_frames=self.cfg.unlock_max_frames)
+
+    def _session_rate(self) -> float | None:
+        sessions = [e for e in self.metrics.events({"lock_session"}) if e.get("face_seen")][-30:]
+        if len(sessions) < 5:
+            return None
+        return sum(1 for e in sessions if e.get("face_accepted")) / len(sessions)
+
+    def _threshold_apply(self, request: dict, *, by: str = "you") -> dict:
+        report = self._threshold_report()
+        if report is None or report.status != "tighten":
+            return {"ok": False, "reason": "no-recommendation"}
+        value = request.get("value", report.recommended)
+        if not isinstance(value, (int, float)) or abs(value - report.recommended) > 1e-9:
+            return {"ok": False, "reason": "stale-recommendation"}
+        self.adaptation.take_snapshot(self.cfg, "Before a stricter recognition setting")
+        entry = self.adaptation.apply_threshold(
+            float(value), cfg=self.cfg, reason=report.explanation,
+            evidence=report.to_dict()["evidence"], by=by, session_rate=self._session_rate())
+        return {"ok": True, "entry": entry}
+
+    def _threshold_clear(self) -> dict:
+        entry = self.adaptation.clear_tuned_threshold(reason="You restored your own setting",
+                                                      by="you")
+        return {"ok": True, "entry": entry}
+
+    def maybe_auto_tighten(self) -> None:
+        """Opt-in: apply a stricter threshold when evidence supports it."""
+        if not self.cfg.auto_tighten_threshold:
+            return
+        state = self.adaptation.snapshot_dict()["threshold"]
+        if state.get("probation"):
+            return
+        report = self._threshold_report()
+        if report is not None and report.status == "tighten":
+            self._threshold_apply({"value": report.recommended}, by="automatic")
+
+    def _snapshot_restore(self, request: dict) -> dict:
+        """Return a saved configuration (the app saves it) and restore its tuning."""
+        index = request.get("index")
+        if not isinstance(index, int):
+            return {"ok": False, "reason": "invalid-index"}
         try:
-            new_cfg.validate()
-        except ValueError as e:
-            return {"ok": False, "reason": f"invalid-config: {e}"}
-        old_device_id = self.cfg.camera_device_id
-        old_index = self.cfg.camera_index
-        old_persistent = self.cfg.persistent_camera
-        self.cfg = new_cfg
-        self.recog.cfg = new_cfg
-        # Reset camera if camera-affecting settings changed
-        if (new_cfg.camera_device_id != old_device_id or new_cfg.camera_index != old_index
-                or new_cfg.persistent_camera != old_persistent):
-            with self._cam_lock:
-                self._cancel_unlock_camera_release()
-                self._release_camera()
-        return {"ok": True, "config": asdict(new_cfg)}
+            restored = self.adaptation.restore_snapshot(index)
+        except (IndexError, ValueError) as exc:
+            return {"ok": False, "reason": "invalid-snapshot", "message": str(exc)}
+        return {"ok": True, "config": asdict(restored)}
 
-    def _handle(self, req: dict) -> dict:
-        cmd = req.get("cmd")
-        if cmd == "ping":
-            return {"ok": True, "pong": True}
+    def _camera_list(self) -> dict:
+        try:
+            cameras = list_cameras()
+        except Exception as exc:
+            return {"ok": False, "reason": "enumeration-failed", "message": str(exc)}
+        return {"ok": True, "cameras": [
+            {"name": c.name, "path": c.path, "virtual": c.virtual,
+             "selected": bool(self.cfg.camera_device_id) and c.identity ==
+             self.cfg.camera_device_id.casefold().split("#{", 1)[0]} for c in cameras]}
 
-        if cmd == "status":
-            return self._status()
+    def _clear_measurements(self) -> dict:
+        removed = self.metrics.clear()
+        self.evaluation.clear()
+        self.adaptation.note("measurements", None, "cleared",
+                             "You cleared local measurements", by="you")
+        return {"ok": True, "removed": removed}
 
-        if cmd == "reload_config":
-            return self._reload_config()
+    def _low_light_reset(self) -> dict:
+        self.camera_profile.reset()
+        self.adaptation.note("camera", None, "re-measure",
+                             "You asked the app to re-measure camera behaviour", by="you")
+        return {"ok": True}
 
-        if cmd == "shutdown":
-            log.info("shutdown requested via pipe")
-            self._stop.set()
-            return {"ok": True, "shutting_down": True}
+    def _routine_reset(self) -> dict:
+        self.routine.reset()
+        self.adaptation.note("routine", None, "forgotten",
+                             "You asked the app to forget when you usually come back", by="you")
+        return {"ok": True}
 
-        if cmd == "pause_camera":
-            # Release the webcam and ignore probe/verify for the requested
-            # number of seconds so the enrollment wizard can own it.
-            seconds = float(req.get("seconds", 120))
-            self._camera_paused_until = time.time() + max(5.0, seconds)
-            with self._cam_lock:
-                self._cancel_unlock_camera_release()
-                self._release_camera()
-            log.info("camera leased out for %.0fs (enrollment)", seconds)
-            return {"ok": True, "paused_until": self._camera_paused_until}
+    # ---- lifecycle -----------------------------------------------------------
 
-        if cmd == "resume_camera":
-            was = self._camera_paused_until
-            self._camera_paused_until = 0.0
-            log.info("camera lease cleared (was until %s)", was)
-            return {"ok": True}
+    def reload_config(self) -> dict:
+        result = load_config()
+        if result.source == "defaults" and result.problems:
+            return {"ok": False, "reason": "invalid-config", "problems": result.problems}
+        old = self.cfg
+        if asdict(old) != asdict(result.config):
+            self.adaptation.take_snapshot(old, "Before your settings change")
+        self.cfg = result.config
+        self.recognizer.cfg = result.config
+        self.config_problems = result.problems
+        if (old.camera_device_id != self.cfg.camera_device_id
+                or old.camera_index != self.cfg.camera_index
+                or old.persistent_camera != self.cfg.persistent_camera):
+            self.camera.release_now()
+            self._device_status = None
+        log.info("configuration reloaded (%d problem(s))", len(result.problems))
+        return {"ok": True, "problems": result.problems}
 
-        if cmd == "build_enrollment":
+    def shutdown(self) -> dict:
+        log.info("shutdown requested")
+        self._stopping.set()
+        self.pacer.stop()
+        if self.server is not None:
+            self.server.stop()
+        return {"ok": True, "shutting_down": True}
+
+    def start_warmup(self) -> threading.Thread:
+        """Load in the background; requests that need the camera wait for it (bounded)."""
+        self._warm.clear()
+        thread = threading.Thread(target=self.warmup, name="warmup", daemon=True)
+        thread.start()
+        return thread
+
+    def warmup(self) -> None:
+        """Load the profile and model so the first sign-in is fast."""
+        self._ready_reason = "loading"
+        try:
             try:
-                from .config import ENROLL_DIR
-                n = self.recog.enroll_from_dir(ENROLL_DIR)
-                return {"ok": True, "count": n}
-            except Exception as e:
-                log.exception("build_enrollment failed")
-                return {"ok": False, "reason": str(e)}
-
-        if cmd == "verify":
-            ok, dist, real, _candidates = self._capture_and_verify()
-            return {"ok": True, "match": ok, "distance": dist, "real": real}
-
-        if cmd == "presence":
-            if self._unlock_priority_active():
-                log.info("presence probe skipped: lock-screen unlock is active")
-                return {
-                    "ok": True,
-                    "present": True,
-                    "real": True,
-                    "mode": self.cfg.presence_mode,
-                    "skipped": "unlock-active",
-                }
-            present, real = self._presence_probe()
-            return {"ok": True, "present": present, "real": real, "mode": self.cfg.presence_mode}
-
-        if cmd == "unlock":
-            self._begin_unlock_request()
-            try:
-                self._unlock_priority_until = (
-                    time.monotonic() + UNLOCK_PRIORITY_GRACE_S
-                )
-                self._prune_preauth_candidates()
-                ok, dist, real, candidates = self._capture_and_verify(for_unlock=True)
-                if not ok:
-                    # A failed 2-of-3 vote can still contain a safe near-anchor
-                    # frame. Keep only those embeddings in memory for a short
-                    # window; nothing is persisted until a later face unlock is
-                    # accepted by Windows.
-                    self._remember_preauth_candidates(candidates)
-                    return {"ok": False, "reason": "no-match", "distance": dist, "real": real}
-                creds = load_password()
-                if not creds:
-                    self._preauth_candidates.clear()
-                    return {"ok": False, "reason": "no-credentials"}
-                candidate_pool = self._consume_preauth_candidates(candidates)
-                attempt_id = self.recog.stage_adaptive(candidate_pool)
-                response = {
-                    "ok": True,
-                    "username": creds["u"],
-                    "password": creds["p"],
-                    "domain": creds.get("d", "."),
-                }
-                if attempt_id:
-                    response["attempt_id"] = attempt_id
-                return response
-            finally:
-                self._end_unlock_request()
-
-        if cmd == "unlock_result":
-            attempt_id = req.get("attempt_id")
-            accepted = req.get("accepted")
-            if not isinstance(attempt_id, str) or not isinstance(accepted, bool):
-                return {"ok": False, "reason": "invalid-unlock-result"}
-            added = self.recog.finish_adaptive(attempt_id, accepted)
-            log.info("adaptive unlock result accepted=%s added=%d", accepted, added)
-            return {"ok": True, "added": added}
-
-        return {"ok": False, "reason": "unknown-command"}
-
-    def _handle_connection(self, handle, req: dict) -> None:
-        """Handle one parsed request without blocking the pipe accept loop."""
-        try:
-            try:
-                resp = self._handle(req)
-            except Exception as e:
-                log.exception("handler error")
-                resp = {"ok": False, "reason": f"exception: {e}"}
-            try:
-                win32file.WriteFile(
-                    handle,
-                    (json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"),
-                )
-                try:
-                    win32file.FlushFileBuffers(handle)
-                except pywintypes.error:
-                    pass
-            except pywintypes.error as e:
-                # LogonUI closes a cancelled request when the user presses
-                # Enter or changes tiles. That is an expected cancellation.
-                error_code = getattr(e, "winerror", None)
-                if error_code is None and getattr(e, "args", None):
-                    error_code = e.args[0]
-                if error_code in (109, 232):
-                    log.info("client closed request pipe (cancelled)")
-                else:
-                    raise
-        finally:
-            try:
-                win32pipe.DisconnectNamedPipe(handle)
-            except pywintypes.error:
-                pass
-            win32file.CloseHandle(handle)
-            with self._request_threads_lock:
-                self._request_threads.discard(threading.current_thread())
-
-    def _serve_one(self) -> None:
-        """Accept one request and hand slow work to a daemon worker."""
-        sa = _build_pipe_sa()
-        handle = win32pipe.CreateNamedPipe(
-            PIPE_NAME,
-            win32pipe.PIPE_ACCESS_DUPLEX,
-            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
-            win32pipe.PIPE_UNLIMITED_INSTANCES,
-            65536, 65536, 0, sa,
-        )
-        handed_off = False
-        try:
-            win32pipe.ConnectNamedPipe(handle, None)
-            _hr, data = win32file.ReadFile(handle, 65536)
-            req = json.loads(data.decode("utf-8"))
-            log.info("request cmd=%s", req.get("cmd"))
-            worker = threading.Thread(
-                target=self._handle_connection,
-                args=(handle, req),
-                name=f"FaceService-{req.get('cmd', 'request')}",
-                daemon=True,
-            )
-            with self._request_threads_lock:
-                self._request_threads.add(worker)
-            worker.start()
-            handed_off = True
-        finally:
-            if not handed_off:
-                try:
-                    win32pipe.DisconnectNamedPipe(handle)
-                except pywintypes.error:
-                    pass
-                win32file.CloseHandle(handle)
-
-    def _warmup(self) -> None:
-        """Load enrollment, preload heavy models so the first real call is fast."""
-        import numpy as np
-        try:
-            self.recog.load()
-            log.info("enrollment loaded: %s", self.recog._refs is not None)
-        except Exception as e:
-            log.warning("enrollment load: %s", e)
-
-        # Force-load ArcFace + detector + MiniFASNet with a dummy image.
-        # Using one of our enrolled photos guarantees a face is present.
-        try:
-            from .config import ENROLL_DIR
-            import cv2
-            enroll_imgs = list(ENROLL_DIR.glob("*.jpg")) + list(ENROLL_DIR.glob("*.png"))
-            if enroll_imgs:
-                img = cv2.imread(str(enroll_imgs[0]))
-                if img is not None:
-                    t0 = time.time()
-                    self.recog.verify_frame(img)
-                    log.info("model warmup ok in %.2fs", time.time() - t0)
-        except Exception as e:
-            log.warning("model warmup failed: %s", e)
-
-        # Also warm up the camera (open + close if not persistent)
-        try:
-            cam = self._get_camera()
-            cam.read()
-            log.info("camera warmup ok (persistent=%s)", self.cfg.persistent_camera)
-            if not self.cfg.persistent_camera:
-                self._release_camera()
-        except Exception as e:
-            log.warning("camera warmup failed: %s", e)
-
-    def serve_forever(self) -> None:
-        import win32event  # type: ignore
-        import winerror    # type: ignore
-        # Single-instance guard: if another FaceService is already serving
-        # this pipe, bail out cleanly instead of competing for connections.
-        try:
-            mutex = win32event.CreateMutex(None, False, "Local\\FaceUnlockService")
-            if win32api_get_last_error() == winerror.ERROR_ALREADY_EXISTS:
-                log.warning("another FaceService instance already running; exiting")
-                return
-        except Exception as e:
-            log.warning("mutex check failed, continuing: %s", e)
-
-        log.info("FaceService starting; pipe=%s", PIPE_NAME)
-        if self.cfg.warmup_on_start:
-            self._warmup()
-
-        while not self._stop.is_set():
-            try:
-                self._serve_one()
+                loaded = self.recognizer.load()
+                log.info("face profile loaded: %s", loaded)
             except Exception:
-                log.exception("pipe error")
-                time.sleep(0.5)
+                log.exception("face profile could not be loaded")
+            if self.cfg.warmup_on_start:
+                self._warm_model()
+            self._device()
+        finally:
+            self._ready_reason = "ready"
+            self._warm.set()
 
-        log.info("FaceService stopped")
-        with self._cam_lock:
-            self._cancel_unlock_camera_release()
-            self._release_camera()
+    def _warm_model(self) -> None:
+        started = time.perf_counter()
+        try:
+            self.recognizer.embedder.load()
+            # Compare the compiled model with DeepFace on a stored photo
+            # (the first few may contain no detectable face).
+            for sample in sorted(ENROLL_DIR.glob("*.jpg"))[:12]:
+                image = cv2.imread(str(sample))
+                distance = (self.recognizer.embedder.self_check(image)
+                            if image is not None else None)
+                if distance is not None:
+                    log.info("embedding self-check: max difference %.2e (%s)", distance,
+                             "ok" if self.recognizer.embedder.compiled_ok else "fallback")
+                    break
+            else:
+                log.info("embedding self-check skipped: no usable stored photo")
+            log.info("model ready in %.1f s", time.perf_counter() - started)
+        except Exception:
+            log.exception("model warm-up failed")
 
-    def stop(self) -> None:
-        self._stop.set()
 
-
-def _setup_logging() -> None:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
-    )
+def _single_instance() -> Any:
+    import win32api
+    import win32event
+    import winerror
+    mutex = win32event.CreateMutex(None, False, "Local\\FaceUnlockService")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        return None
+    return mutex
 
 
 def main() -> None:
-    _setup_logging()
-    cfg = Config.load()
-    svc = FaceService(cfg)
+    setup_logging(LOG_PATH)
+    result = load_config()
+    for problem in result.problems:
+        log.warning("config: %s", problem)
+    mutex = _single_instance()
+    if mutex is None:
+        log.warning("another FaceService instance is already running; exiting")
+        return
+    watcher = SessionWatcher()
+    service = FaceService(result.config, problems=result.problems, watcher=watcher)
+    watcher.start()
+    server = PipeServer(PIPE_NAME, service.handle)
+    service.server = server
+    log.info("FaceService %s starting; pipe=%s", __version__, PIPE_NAME)
+    service.start_warmup()
+
+    def housekeeping() -> None:
+        service.adaptation.take_snapshot(service.cfg, "Settings when the service started")
+        while not service._stopping.wait(3600):
+            try:
+                service.maybe_auto_tighten()
+            except Exception:
+                log.exception("housekeeping failed")
+
+    threading.Thread(target=housekeeping, name="housekeeping", daemon=True).start()
     try:
-        svc.serve_forever()
+        server.serve_forever()
     except KeyboardInterrupt:
-        svc.stop()
+        pass
+    finally:
+        service.pacer.stop()
+        service.camera.close()
+        service.camera_profile.flush()
+        watcher.stop()
+        log.info("FaceService stopped")
 
 
 if __name__ == "__main__":

@@ -1,22 +1,28 @@
-"""Quick pipe client for testing."""
-import json, sys, time
-import win32file, pywintypes
+"""Send one command to the running FaceService and print the reply.
 
-PIPE = r"\\.\pipe\FaceUnlock"
-cmd = sys.argv[1] if len(sys.argv) > 1 else "ping"
+Usage: python -m tools.pipe_test [status|ping|presence|insights|...]
 
-for _ in range(30):
-    try:
-        h = win32file.CreateFile(PIPE,
-            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-            0, None, win32file.OPEN_EXISTING, 0, None)
-        break
-    except pywintypes.error:
-        time.sleep(1)
-else:
-    print("pipe unreachable"); sys.exit(1)
+The ``unlock`` command is refused here: its reply contains your Windows
+password and is meant only for the sign-in screen.
+"""
+from __future__ import annotations
 
-win32file.WriteFile(h, json.dumps({"cmd": cmd}).encode())
-_, data = win32file.ReadFile(h, 65536)
-print(data.decode())
-win32file.CloseHandle(h)
+import json
+import sys
+
+from face_service.config import PIPE_NAME
+from face_service.pipe import call
+
+
+def main() -> None:
+    command = sys.argv[1] if len(sys.argv) > 1 else "ping"
+    if command == "unlock":
+        raise SystemExit("Refusing to request credentials from a command-line tool.")
+    reply = call(PIPE_NAME, {"cmd": command}, timeout_s=30.0)
+    if reply is None:
+        raise SystemExit("FaceService is not responding.")
+    print(json.dumps(reply, indent=2))
+
+
+if __name__ == "__main__":
+    main()

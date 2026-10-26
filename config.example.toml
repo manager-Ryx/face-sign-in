@@ -1,37 +1,67 @@
-# Copy this to %USERPROFILE%\.face-unlock\config.toml and edit.
+# Face Unlock settings. The app writes %USERPROFILE%\.face-unlock\config.toml
+# for you; most people never need to edit this file by hand. Invalid values
+# are rejected and replaced by your last working settings (see the app's
+# Overview page for any problems found).
 
-model_name = "ArcFace"          # DeepFace model: ArcFace, Facenet512, VGG-Face, ...
-detector_backend = "opencv"     # opencv, retinaface, mtcnn, yunet, ssd
+# --- Recognition -----------------------------------------------------------
+model_name = "ArcFace"
+detector_backend = "yunet"
 distance_metric = "cosine"
-threshold = 0.45                # cosine distance; lower = stricter. Tune per camera.
-anti_spoofing = true
+threshold = 0.45                # strictest match allowed; lower is stricter (0.20-0.68)
+anti_spoofing = true            # reject printed photos / screens (adds time per frame)
+detector_min_confidence = 0.80  # face-detection score for live frames (not identity)
+inference_threads = 4           # CPU threads per recognition step
 
-camera_index = 0
-verify_frames = 5               # frames captured per verify
-verify_required = 3             # matches needed out of verify_frames
-unlock_verify_frames = 3        # fast lock-screen vote; inference-limited, not fixed FPS
-unlock_verify_required = 2      # preserve multi-frame identity confirmation
-unlock_camera_hold_s = 15.0     # keep camera warm across slow active lock-screen retries
+# --- Camera ----------------------------------------------------------------
+camera_device_id = ""           # USB identity of the only camera allowed; set in the app
+camera_index = 0                # legacy fallback when no identity is set
+camera_warmup_frames = 12       # upper limit; warm-up stops as soon as the image is stable
+camera_warmup_max_s = 2.0
+camera_low_light_fps = 15.0     # 0 disables; used only after it proves it helps
+persistent_camera = false       # true keeps the camera (and its light) on all the time
+unlock_camera_hold_s = 15.0     # upper limit for keeping the camera open between retries
 
-# Adaptive enrollment is opt-in. It stores embeddings, not photos, and updates
-# only after Windows reports that a face-submitted credential was accepted.
+# --- Sign-in screen -----------------------------------------------------------
+unlock_strategy = "progressive" # or "fixed" (always 3 frames)
+unlock_verify_frames = 3        # frames for the fixed strategy
+unlock_verify_required = 2      # matching frames needed to sign in
+unlock_max_frames = 5           # most frames per progressive attempt
+unlock_idle_after_s = 60.0      # continuous scanning after you leave (until a routine is learned)
+unlock_idle_interval_s = 10.0   # seconds between quick looks otherwise
+unlock_learn_routine = true     # scan continuously when you usually come back (counts only)
+unlock_pause_when_display_off = true
+unlock_client_check = "log"     # "enforce": only the sign-in screen may request the password
+
+# --- Learning ----------------------------------------------------------------
+# Learns only from face sign-ins Windows confirmed; stores face signatures,
+# not photos (unless adaptive_keep_photos = true).
 adaptive_enrollment = false
-adaptive_samples_per_unlock = 2
-adaptive_pre_auth_enabled = true  # transient safe embeddings from recent failed votes
-adaptive_pre_auth_max_frames = 24 # memory-only candidate cap
-adaptive_pre_auth_ttl_s = 45.0     # discard candidates after this many seconds
-adaptive_max_embeddings = 300   # adaptive-only cap; manual anchors are stored in addition
-adaptive_retention_days = 14.0  # rolling age window; 0 disables age expiry
-adaptive_match_margin = 0.10    # require distance <= threshold - margin against a manual anchor
-adaptive_min_diversity = 0.025  # reject near-duplicate embeddings
+adaptive_samples_per_unlock = 1
+adaptive_max_embeddings = 300   # learned samples kept, in addition to your enrollment
+adaptive_retention_days = 0.0   # 0 keeps samples until the limit is reached
+adaptive_match_margin = 0.10    # learned samples must match an original photo this closely
+adaptive_min_diversity = 0.025  # skip near-duplicates
 adaptive_min_face_confidence = 0.90
 adaptive_min_face_area_ratio = 0.04
 adaptive_min_blur = 40.0
+adaptive_keep_photos = false
+adaptive_photo_limit = 50
+auto_tighten_threshold = false  # allow evidence-based, automatic stricter matching
 
-presence_interval_s = 60        # 1 minute
-presence_absence_timeout_s = 120 # lock after 2 uninterrupted minutes without a match
-presence_absent_strikes = 2     # legacy fallback; used only when timeout is 0
-presence_mode = "recognition"   # "recognition" (DeepFace must match enrolled)
-                                # or "detection" (YuNet any-face-in-frame)
+# --- Presence and auto-lock ------------------------------------------------------
+presence_enabled = true
+presence_interval_s = 300       # check every 5 minutes
+presence_absence_timeout_s = 3600   # lock after about an hour away
+presence_absent_strikes = 2     # legacy; used only when the timeout is 0
+presence_mode = "recognition"   # or "detection" (any face counts)
+presence_pause_while_locked = true
+absence_learning = false        # optional away-time statistics (counts only)
+adaptive_lock = false           # optional shorter timeout when usually gone for hours
+adaptive_lock_min_timeout_s = 900
 
+# --- App -------------------------------------------------------------------------
 warmup_on_start = true
+theme = "system"                # "system", "light" or "dark"
+notifications = true
+check_for_updates = false
+metrics_retention_days = 90

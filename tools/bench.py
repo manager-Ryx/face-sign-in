@@ -1,34 +1,45 @@
-"""Run N verify calls through the pipe and print timing."""
-import json, sys, time
-import win32file, pywintypes
+"""Time recognition checks through the running FaceService.
 
-PIPE = r"\\.\pipe\FaceUnlock"
-N = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+Usage: python -m tools.bench [N] [--record]
 
-for i in range(N):
-    for _ in range(60):
-        try:
-            h = win32file.CreateFile(PIPE,
-                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0, None, win32file.OPEN_EXISTING, 0, None)
-            break
-        except pywintypes.error:
-            time.sleep(0.5)
-    else:
-        print(f"call {i+1}: PIPE UNREACHABLE after 30s")
-        sys.exit(1)
+Each run opens the camera, waits for a stable image, and analyses five
+frames. Prints per-run timing and outcome; nothing is learned, and runs are
+only kept as evaluation data with ``--record``.
+"""
+from __future__ import annotations
 
-    t0 = time.time()
-    try:
-        win32file.WriteFile(h, json.dumps({"cmd": "verify"}).encode())
-        _, data = win32file.ReadFile(h, 65536)
-    finally:
-        try: win32file.CloseHandle(h)
-        except Exception: pass
+import statistics
+import sys
+import time
 
-    dt = time.time() - t0
-    try:
-        r = json.loads(data.decode())
-    except Exception:
-        r = {"raw": data}
-    print(f"call {i+1}: {dt:.2f}s  match={r.get('match')} dist={r.get('distance', 0):.3f} real={r.get('real')}")
+from face_service.config import PIPE_NAME
+from face_service.pipe import call
+
+
+def main() -> None:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    runs = int(args[0]) if args else 3
+    record = "--record" in sys.argv
+    totals, opens, analyses = [], [], []
+    for index in range(runs):
+        started = time.perf_counter()
+        reply = call(PIPE_NAME, {"cmd": "check", "record": record}, timeout_s=60.0)
+        elapsed = time.perf_counter() - started
+        if not reply or not reply.get("ok"):
+            print(f"run {index + 1}: failed ({(reply or {}).get('reason', 'no reply')})")
+            continue
+        totals.append(elapsed)
+        opens.append(reply["camera_open_ms"] / 1000)
+        analyses.append(reply["verify_ms"] / 1000)
+        distances = [f["distance"] for f in reply["frames"] if f["distance"] is not None]
+        print(f"run {index + 1}: {elapsed:.2f}s total (camera {opens[-1]:.2f}s, analysis "
+              f"{analyses[-1]:.2f}s) accepted={reply['accepted']} reason={reply['reason']} "
+              f"best={min(distances) if distances else '-'}")
+        time.sleep(1.0)
+    if totals:
+        print(f"median: {statistics.median(totals):.2f}s total, "
+              f"{statistics.median(opens):.2f}s camera, {statistics.median(analyses):.2f}s analysis")
+
+
+if __name__ == "__main__":
+    main()

@@ -2,6 +2,7 @@
 #include "FaceCredentialProvider.h"
 #include "helpers.h"
 #include "PipeClient.h"
+#include "dll.h"
 #include "guid.h"
 
 namespace FaceUnlock {
@@ -44,13 +45,18 @@ struct SensitiveCredential {
 FaceCredential::FaceCredential(FaceCredentialProvider* owner)
     : m_cRef(1), m_cpus(CPUS_INVALID), m_pEvents(nullptr),
       m_label(L"Face Unlock"), m_status(L"Looking for you"), m_ready(false),
-      m_owner(owner) {}
+      m_owner(owner) {
+    DllAddRef();
+}
 
 FaceCredential::~FaceCredential() {
     UnAdvise();
     ClearPendingCredential();
-    std::lock_guard<std::mutex> lock(m_mutex);
-    SecureErase(m_inflightAttemptId);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        SecureErase(m_inflightAttemptId);
+    }
+    DllRelease();
 }
 
 HRESULT FaceCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus) {

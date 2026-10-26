@@ -1,444 +1,626 @@
+"""Recognition: frame analysis, identity matching, enrollment, and learning.
+
+Every frame is classified as one of the :class:`Outcome` values. Image
+quality and identity are kept apart: a frame whose face matches the profile
+is a match whatever its brightness; a frame that does not match is only
+called a *mismatch* when the image was good enough to judge – otherwise it
+is *unusable* and comes with guidance. Nothing here ever relaxes the
+threshold.
+
+Learning is a two-step transaction. ``stage_learning`` picks at most one
+safe frame from a successful attempt and keeps it in memory under a random
+attempt id. ``finish_learning`` commits it only when Windows reports that the
+face-submitted credential was accepted. Missing, failed, late, or repeated
+reports never change the profile.
+"""
 from __future__ import annotations
 
 import logging
-import os
+import math
 import secrets
-import tempfile
+import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from .adaptive import (
-    cosine_distances,
-    is_safe_adaptive_candidate,
-    select_rolling_adaptive_indices,
+from .adaptive import LearningCandidate, choose_learning_sample, select_retained
+from .config import EMBED_PATH, ENROLL_DIR, LEARNED_PHOTOS_DIR, Config
+from .embedder import Embedder
+from .metrics import MetricsStore, NullMetrics
+from .profile import (
+    SOURCE_ENROLLMENT,
+    SOURCE_MANUAL,
+    SOURCE_UNLOCK,
+    FaceProfile,
+    lighting_code,
+    load_profile,
+    save_profile,
+    unit,
 )
-from .config import Config, EMBED_PATH, ENROLL_DIR
+from .quality import ImageQuality, assess, primary_issue, to_gray
 
 log = logging.getLogger(__name__)
 
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+ENROLL_MIN_CONFIDENCE = 0.90
+PENDING_TTL_S = 120.0
+MAX_PENDING = 8
+RECENT_KEEP_FRACTION = 0.2
 
-def _lazy_deepface():
-    # Imported lazily because TensorFlow import is slow and heavy.
-    from deepface import DeepFace  # type: ignore
-    return DeepFace
+
+class Outcome(StrEnum):
+    MATCH = "match"
+    UNCERTAIN = "uncertain"
+    MISMATCH = "mismatch"
+    UNUSABLE = "unusable"
+    NO_FACE = "no_face"
+    SPOOF = "spoof"
+    ERROR = "error"
+
+
+class NotEnrolledError(RuntimeError):
+    """No face profile exists yet."""
 
 
 @dataclass
 class FrameAnalysis:
-    match: bool
-    distance: float
-    is_real: bool
-    embedding: np.ndarray | None = None
+    outcome: Outcome
+    distance: float = 1.0
     anchor_distance: float = 1.0
-    quality: float = 0.0
+    quality: ImageQuality | None = None
     face_count: int = 0
-    adaptive_eligible: bool = False
+    face_confidence: float = 0.0
+    is_real: bool = True
+    captured_at: float = 0.0
+    analyze_ms: float = 0.0
+    embedding: np.ndarray | None = field(default=None, repr=False)
+    face_crop: np.ndarray | None = field(default=None, repr=False)
+
+    @property
+    def match(self) -> bool:
+        return self.outcome is Outcome.MATCH
+
+    @property
+    def issue(self) -> str | None:
+        if self.outcome is Outcome.NO_FACE:
+            return "no_face"
+        if self.outcome is Outcome.SPOOF:
+            return "spoof"
+        return primary_issue(self.quality.issues) if self.quality else None
 
 
 @dataclass
-class _PendingAdaptive:
-    created_at: float
-    embeddings: list[np.ndarray]
-    qualities: list[float]
+class LearnResult:
+    added: int
+    reason: str
+    sample_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class ImageResult:
+    name: str
+    accepted: bool
+    reason: str = ""
+    quality: float = 0.0
+
+
+@dataclass
+class BuildReport:
+    accepted: int
+    rejected: int
+    results: list[ImageResult]
+    anchors: int
+    learned: int
+    consistency: float | None = None
+    holdout: list[tuple[np.ndarray, str]] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class _Pending:
+    created: float
+    attempt: str
+    candidates: list[LearningCandidate]
+    photos: list[np.ndarray | None]
 
 
 class Recognizer:
-    """DeepFace recognizer with immutable anchors and bounded adaptation."""
+    """Identity matching against an immutable, atomically swapped profile."""
 
-    _PENDING_TTL_S = 120.0
-    _MAX_PENDING_ATTEMPTS = 8
-
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, *, embedder: Embedder | None = None,
+                 profile_path: Path | None = None, metrics: MetricsStore | None = None,
+                 threshold: Callable[[], float] | None = None,
+                 clock: Callable[[], float] = time.time,
+                 monotonic: Callable[[], float] = time.monotonic):
         self.cfg = cfg
-        self._refs: np.ndarray | None = None
-        self._protected_count = 0
-        self._qualities = np.empty((0,), dtype=np.float32)
-        self._created_at = np.empty((0,), dtype=np.float64)
-        self._pending: dict[str, _PendingAdaptive] = {}
+        self.embedder = embedder or Embedder(cfg.model_name, cfg.detector_backend,
+                                             cfg.inference_threads)
+        self.profile_path = profile_path or EMBED_PATH
+        self.metrics = metrics or NullMetrics()
+        self._threshold = threshold or (lambda: self.cfg.threshold)
+        self._clock = clock
+        self._monotonic = monotonic
+        self._lock = threading.RLock()
+        self._profile: FaceProfile | None = None
+        self._pending: dict[str, _Pending] = {}
 
-    # ---------- profile persistence ----------
+    # ---- profile -----------------------------------------------------------
 
-    @staticmethod
-    def _atomic_save_profile(
-        embeddings: np.ndarray,
-        protected_count: int,
-        qualities: np.ndarray,
-        created_at: np.ndarray,
-    ) -> None:
-        EMBED_PATH.parent.mkdir(parents=True, exist_ok=True)
-        handle = tempfile.NamedTemporaryFile(
-            mode="wb", prefix="embeddings-", suffix=".npz",
-            dir=EMBED_PATH.parent, delete=False,
-        )
-        temp_path = Path(handle.name)
-        try:
-            with handle:
-                np.savez(
-                    handle,
-                    embeddings=np.asarray(embeddings, dtype=np.float32),
-                    protected_count=np.asarray(protected_count, dtype=np.int64),
-                    qualities=np.asarray(qualities, dtype=np.float32),
-                    created_at=np.asarray(created_at, dtype=np.float64),
-                    profile_version=np.asarray(3, dtype=np.int64),
-                )
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, EMBED_PATH)
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
+    @property
+    def profile(self) -> FaceProfile | None:
+        return self._profile
 
-    def _install_profile(
-        self,
-        embeddings: np.ndarray,
-        protected_count: int,
-        qualities: np.ndarray,
-        created_at: np.ndarray,
-    ) -> None:
-        self._refs = np.asarray(embeddings, dtype=np.float32)
-        self._protected_count = max(0, min(int(protected_count), len(self._refs)))
-        self._qualities = np.asarray(qualities, dtype=np.float32)
-        self._created_at = np.asarray(created_at, dtype=np.float64)
-
-    def _apply_adaptive_retention(self, now: float, *, persist: bool) -> bool:
-        """Expire and cap adaptive samples without ever removing anchors."""
-        if self._refs is None:
-            return False
-        protected_count = self._protected_count
-        protected = self._refs[:protected_count]
-        protected_qualities = self._qualities[:protected_count]
-        protected_created = self._created_at[:protected_count]
-        adaptive = self._refs[protected_count:]
-        adaptive_qualities = self._qualities[protected_count:]
-        adaptive_created = self._created_at[protected_count:].copy()
-
-        # Profiles written by an earlier adaptive implementation may lack a
-        # usable timestamp. Preserve those samples and begin their rolling age
-        # at migration time instead of deleting them unexpectedly.
-        invalid = ~np.isfinite(adaptive_created) | (adaptive_created <= 0.0)
-        if np.any(invalid):
-            adaptive_created[invalid] = now
-
-        retention_seconds = self.cfg.adaptive_retention_days * 24.0 * 60.0 * 60.0
-        cutoff = -float("inf") if retention_seconds == 0.0 else now - retention_seconds
-        chosen = select_rolling_adaptive_indices(
-            adaptive,
-            adaptive_qualities,
-            adaptive_created,
-            limit=self.cfg.adaptive_max_embeddings,
-            cutoff=cutoff,
-        )
-
-        final_refs = protected.copy()
-        final_qualities = protected_qualities.copy()
-        final_created = protected_created.copy()
-        if chosen:
-            final_refs = np.vstack((final_refs, adaptive[chosen]))
-            final_qualities = np.concatenate(
-                (final_qualities, adaptive_qualities[chosen])
-            )
-            final_created = np.concatenate((final_created, adaptive_created[chosen]))
-
-        metadata_changed = not np.array_equal(adaptive_created, self._created_at[protected_count:])
-        content_changed = len(chosen) != len(adaptive) or chosen != list(range(len(adaptive)))
-        changed = metadata_changed or content_changed
-        if changed:
-            if persist:
-                self._atomic_save_profile(
-                    final_refs, protected_count, final_qualities, final_created
-                )
-            self._install_profile(
-                final_refs, protected_count, final_qualities, final_created
-            )
-        return changed
-
-    # ---------- enrollment ----------
-
-    def enroll_from_dir(self, directory: Path = ENROLL_DIR) -> int:
-        """Rebuild manual anchors; adaptive samples are intentionally reset."""
-        DeepFace = _lazy_deepface()
-        directory.mkdir(parents=True, exist_ok=True)
-        images = [
-            p for p in directory.iterdir()
-            if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        ]
-        if not images:
-            raise RuntimeError(f"No enroll images in {directory}")
-
-        vecs: list[np.ndarray] = []
-        for path in images:
-            try:
-                reps = DeepFace.represent(
-                    img_path=str(path),
-                    model_name=self.cfg.model_name,
-                    detector_backend=self.cfg.detector_backend,
-                    enforce_detection=True,
-                    align=True,
-                )
-                # Manual enrollment also rejects ambiguous multi-face photos.
-                if len(reps) == 1:
-                    vecs.append(np.asarray(reps[0]["embedding"], dtype=np.float32))
-                    log.info("enrolled %s", path.name)
-                else:
-                    log.warning("skip %s: expected one face, found %d", path.name, len(reps))
-            except Exception as exc:
-                log.warning("skip %s: %s", path.name, exc)
-
-        if not vecs:
-            raise RuntimeError("No unambiguous face found in enroll images")
-        embeddings = np.stack(vecs, axis=0)
-        now = time.time()
-        qualities = np.ones((len(embeddings),), dtype=np.float32)
-        created_at = np.full((len(embeddings),), now, dtype=np.float64)
-        self._atomic_save_profile(
-            embeddings, len(embeddings), qualities, created_at
-        )
-        self._install_profile(
-            embeddings, len(embeddings), qualities, created_at
-        )
-        self._pending.clear()
-        return len(vecs)
+    @property
+    def threshold(self) -> float:
+        return float(self._threshold())
 
     def load(self) -> bool:
-        if not EMBED_PATH.exists():
-            return False
-        with np.load(EMBED_PATH, allow_pickle=False) as data:
-            embeddings = np.asarray(data["embeddings"], dtype=np.float32)
-            # Legacy profiles contained embeddings only. Treat every legacy
-            # embedding as a protected manual anchor, never as evictable data.
-            protected_count = (
-                int(np.asarray(data["protected_count"]).item())
-                if "protected_count" in data.files else len(embeddings)
-            )
-            qualities = (
-                np.asarray(data["qualities"], dtype=np.float32)
-                if "qualities" in data.files else np.ones(len(embeddings), dtype=np.float32)
-            )
-            created_at = (
-                np.asarray(data["created_at"], dtype=np.float64)
-                if "created_at" in data.files else np.zeros(len(embeddings), dtype=np.float64)
-            )
-        if len(qualities) != len(embeddings) or len(created_at) != len(embeddings):
-            raise RuntimeError("Enrollment profile metadata length mismatch")
-        self._install_profile(embeddings, protected_count, qualities, created_at)
-        self._apply_adaptive_retention(time.time(), persist=True)
-        return True
+        with self._lock:
+            profile = load_profile(self.profile_path)
+            if profile is None:
+                self._profile = None
+                return False
+            self._profile = profile
+            self._apply_retention_locked(persist=True)
+            return True
+
+    def require_profile(self) -> FaceProfile:
+        profile = self._profile
+        if profile is None and self.load():
+            profile = self._profile
+        if profile is None:
+            raise NotEnrolledError("No face profile yet. Set up face recognition first.")
+        return profile
 
     def profile_counts(self) -> tuple[int, int]:
-        if self._refs is None and not self.load():
-            return 0, 0
-        assert self._refs is not None
-        return self._protected_count, len(self._refs) - self._protected_count
+        profile = self._profile
+        if profile is None and self.load():
+            profile = self._profile
+        return (profile.protected_count, profile.learned_count) if profile else (0, 0)
 
-    # ---------- verification ----------
+    def _install_locked(self, profile: FaceProfile, *, persist: bool) -> None:
+        if persist:
+            save_profile(profile, self.profile_path)
+        self._profile = profile
 
-    def _quality(self, bgr: np.ndarray, rep: dict) -> tuple[float, bool]:
-        confidence = float(rep.get("face_confidence", 1.0) or 0.0)
-        area = rep.get("facial_area") or {}
-        x = max(0, int(area.get("x", 0)))
-        y = max(0, int(area.get("y", 0)))
-        width = max(0, int(area.get("w", 0)))
-        height = max(0, int(area.get("h", 0)))
-        image_h, image_w = bgr.shape[:2]
-        x2, y2 = min(image_w, x + width), min(image_h, y + height)
-        face_ratio = (max(0, x2 - x) * max(0, y2 - y)) / max(1, image_w * image_h)
-        crop = bgr[y:y2, x:x2]
-        blur = (
-            float(cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
-            if crop.size else 0.0
-        )
-        quality = (
-            0.50 * min(1.0, max(0.0, confidence))
-            + 0.25 * min(1.0, face_ratio / 0.12)
-            + 0.25 * min(1.0, blur / 120.0)
-        )
-        eligible = (
-            confidence >= self.cfg.adaptive_min_face_confidence
-            and face_ratio >= self.cfg.adaptive_min_face_area_ratio
-            and blur >= self.cfg.adaptive_min_blur
-        )
-        return quality, eligible
+    def _apply_retention_locked(self, *, persist: bool) -> int:
+        profile = self._profile
+        if profile is None or profile.learned_count == 0:
+            return 0
+        protected = profile.protected_count
+        days = self.cfg.adaptive_retention_days
+        cutoff = -math.inf if days <= 0 else self._clock() - days * 86400.0
+        created = profile.created_at[protected:].copy()
+        # Earlier versions could write samples without a usable timestamp;
+        # start their age now instead of deleting them unexpectedly.
+        created[~np.isfinite(created) | (created <= 0)] = self._clock()
+        limit = self.cfg.adaptive_max_embeddings
+        keep = select_retained(
+            profile.embeddings[protected:], profile.embeddings[:protected], created,
+            profile.qualities[protected:], limit=limit, cutoff=cutoff,
+            recent_keep=max(1, int(limit * RECENT_KEEP_FRACTION)))
+        timestamps_changed = not np.array_equal(created, profile.created_at[protected:])
+        if len(keep) == profile.learned_count and not timestamps_changed:
+            return 0
+        refreshed = FaceProfile.build(
+            profile.embeddings, protected_count=protected, sample_ids=profile.sample_ids,
+            sources=profile.sources,
+            created_at=np.concatenate((profile.created_at[:protected], created)),
+            qualities=profile.qualities, lighting=profile.lighting,
+            anchor_files=profile.anchor_files, next_id=profile.next_id)
+        trimmed = refreshed.keep_learned(keep)
+        removed = profile.learned_count - trimmed.learned_count
+        self._install_locked(trimmed, persist=persist)
+        if removed:
+            self.metrics.record("learned_evicted", count=removed, kept=trimmed.learned_count)
+        return removed
 
-    def analyze_frame(self, bgr: np.ndarray) -> FrameAnalysis:
-        DeepFace = _lazy_deepface()
-        if self._refs is None and not self.load():
-            raise RuntimeError("No enrollment found. Run enroll first.")
-        assert self._refs is not None
+    # ---- analysis ----------------------------------------------------------
 
-        is_real = True
-        if self.cfg.anti_spoofing:
-            try:
-                faces = DeepFace.extract_faces(
-                    img_path=bgr,
-                    detector_backend=self.cfg.detector_backend,
-                    anti_spoofing=True,
-                    enforce_detection=True,
-                )
-                if not faces:
-                    return FrameAnalysis(False, 1.0, False)
-                is_real = bool(faces[0].get("is_real", True))
-                if not is_real:
-                    return FrameAnalysis(False, 1.0, False, face_count=len(faces))
-            except Exception as exc:
-                log.warning("liveness check failed: %s", exc)
-                return FrameAnalysis(False, 1.0, False)
+    def analyze(self, bgr: np.ndarray, *, captured_at: float | None = None,
+                threshold: float | None = None, uncertain_band: float = 0.08,
+                keep_crop: bool = False) -> FrameAnalysis:
+        """Detect, assess, and match one frame."""
+        started = time.perf_counter()
+        profile = self.require_profile()
+        threshold = self.threshold if threshold is None else threshold
+        captured_at = self._monotonic() if captured_at is None else captured_at
+        gray = to_gray(bgr)
+        faces = self.embedder.detect(bgr, min_confidence=self.cfg.detector_min_confidence,
+                                     anti_spoofing=self.cfg.anti_spoofing)
+        if not faces:
+            return FrameAnalysis(Outcome.NO_FACE, quality=assess(gray, None),
+                                 captured_at=captured_at,
+                                 analyze_ms=(time.perf_counter() - started) * 1000.0)
+        face = faces[0]
+        quality = assess(gray, face.box, face_count=len(faces))
+        common = dict(quality=quality, face_count=len(faces),
+                      face_confidence=face.box.confidence, captured_at=captured_at)
+        if self.cfg.anti_spoofing and face.is_real is False:
+            return FrameAnalysis(Outcome.SPOOF, is_real=False, **common,
+                                 analyze_ms=(time.perf_counter() - started) * 1000.0)
+        embedding = self.embedder.embed([face])[0]
+        distances = profile.distances(embedding)
+        best = float(distances.min()) if distances.size else 1.0
+        anchor = (float(distances[: profile.protected_count].min())
+                  if profile.protected_count else 1.0)
+        if best <= threshold:
+            outcome = Outcome.MATCH
+        elif not quality.usable:
+            outcome = Outcome.UNUSABLE
+        elif best <= threshold + uncertain_band:
+            outcome = Outcome.UNCERTAIN
+        else:
+            outcome = Outcome.MISMATCH
+        crop = None
+        if keep_crop and outcome is Outcome.MATCH:
+            b = face.box
+            crop = bgr[max(0, b.y): b.y + b.h, max(0, b.x): b.x + b.w].copy()
+        return FrameAnalysis(outcome, best, anchor, embedding=embedding, face_crop=crop,
+                             analyze_ms=(time.perf_counter() - started) * 1000.0, **common)
 
-        try:
-            reps = DeepFace.represent(
-                img_path=bgr,
-                model_name=self.cfg.model_name,
-                detector_backend=self.cfg.detector_backend,
-                enforce_detection=True,
-                align=True,
-            )
-        except Exception as exc:
-            log.debug("no face: %s", exc)
-            return FrameAnalysis(False, 1.0, is_real)
-        if not reps:
-            return FrameAnalysis(False, 1.0, is_real)
+    # ---- enrollment --------------------------------------------------------
 
-        # Preserve the existing first-face verification behaviour. Adaptive
-        # enrollment is stricter and requires exactly one detected face.
-        rep = reps[0]
-        embedding = np.asarray(rep["embedding"], dtype=np.float32)
-        # One vectorized comparison keeps hundreds of rolling samples cheap.
-        best = float(np.min(cosine_distances(embedding, self._refs)))
-        protected = self._refs[:self._protected_count]
-        anchor_distance = (
-            float(np.min(cosine_distances(embedding, protected)))
-            if len(protected) else 1.0
-        )
-        quality, quality_ok = self._quality(bgr, rep)
-        eligible = (
-            len(reps) == 1
-            and is_real
-            and quality_ok
-            and anchor_distance <= self.cfg.threshold - self.cfg.adaptive_match_margin
-        )
-        return FrameAnalysis(
-            best <= self.cfg.threshold,
-            best,
-            is_real,
-            embedding,
-            anchor_distance,
-            quality,
-            len(reps),
-            eligible,
-        )
+    def _embed_images(self, paths: Iterable[Path]
+                      ) -> tuple[list[np.ndarray], list[str], list[float], list[str], list[ImageResult]]:
+        embeddings, names, qualities, lighting, results = [], [], [], [], []
+        for path in paths:
+            image = cv2.imread(str(path))
+            if image is None:
+                results.append(ImageResult(path.name, False, "could not be read"))
+                continue
+            faces = self.embedder.detect(image, min_confidence=ENROLL_MIN_CONFIDENCE)
+            if len(faces) != 1:
+                reason = "no clear face" if not faces else "more than one face"
+                results.append(ImageResult(path.name, False, reason))
+                continue
+            quality = assess(to_gray(image), faces[0].box, face_count=1)
+            if not quality.usable:
+                issue = primary_issue(quality.issues) or "image quality too low"
+                results.append(ImageResult(path.name, False, issue.replace("_", " ")))
+                continue
+            embeddings.append(self.embedder.embed(faces)[0])
+            names.append(path.name)
+            qualities.append(quality.score())
+            lighting.append(quality.lighting)
+            results.append(ImageResult(path.name, True, quality=quality.score()))
+        return embeddings, names, qualities, lighting, results
 
-    def verify_frame(self, bgr: np.ndarray) -> tuple[bool, float, bool]:
-        """Backward-compatible public verification tuple."""
-        result = self.analyze_frame(bgr)
-        return result.match, result.distance, result.is_real
+    def build_profile(self, paths: list[Path], *, mode: str = "replace",
+                      source: int = SOURCE_ENROLLMENT, dry_run: bool = False,
+                      holdout_every: int = 0) -> BuildReport:
+        """Create (``replace``) or extend (``append``) the original enrollment.
 
-    # ---------- adaptive enrollment transaction ----------
+        Replacing starts a fresh profile and discards learned samples, which
+        were only valid relative to the old enrollment. Appending keeps both.
+        With ``holdout_every=N``, every Nth usable photo is kept aside as an
+        evaluation sample instead of becoming part of the profile.
+        """
+        if mode not in ("replace", "append"):
+            raise ValueError("mode must be 'replace' or 'append'")
+        embeddings, names, qualities, lighting, results = self._embed_images(paths)
+        if not embeddings:
+            raise ValueError("No usable face was found in the photos")
+        holdout: list[tuple[np.ndarray, str]] = []
+        if holdout_every > 1 and len(embeddings) >= 2 * holdout_every:
+            keep = [i for i in range(len(embeddings)) if (i + 1) % holdout_every]
+            holdout = [(embeddings[i], lighting[i]) for i in range(len(embeddings))
+                       if not (i + 1) % holdout_every]
+            embeddings = [embeddings[i] for i in keep]
+            names = [names[i] for i in keep]
+            qualities = [qualities[i] for i in keep]
+            lighting = [lighting[i] for i in keep]
+        new = np.stack(embeddings)
+        now = self._clock()
+        with self._lock:
+            current = self._profile if mode == "append" else None
+            if mode == "append" and current is None:
+                current = load_profile(self.profile_path)
+            consistency = None
+            if current is not None and current.protected_count:
+                anchors_unit = current.unit_rows[: current.protected_count]
+                nearest = [float(np.min(1.0 - anchors_unit @ unit(e))) for e in new]
+                consistency = float(np.median(nearest))
+            if current is None:
+                profile = FaceProfile.build(
+                    new, protected_count=len(new),
+                    sources=np.full(len(new), source, dtype=np.int8),
+                    created_at=np.full(len(new), now),
+                    qualities=np.asarray(qualities, dtype=np.float32),
+                    lighting=np.asarray([lighting_code(x) for x in lighting], dtype=np.int8),
+                    anchor_files=tuple(names))
+            else:
+                p = current.protected_count
+                new_ids = np.arange(current.next_id, current.next_id + len(new), dtype=np.int64)
+                files = (list(current.anchor_files) or [""] * p) + names
+                profile = FaceProfile.build(
+                    np.vstack((current.embeddings[:p], new, current.embeddings[p:])),
+                    protected_count=p + len(new),
+                    sample_ids=np.concatenate((current.sample_ids[:p], new_ids,
+                                               current.sample_ids[p:])),
+                    sources=np.concatenate((current.sources[:p],
+                                            np.full(len(new), source, dtype=np.int8),
+                                            current.sources[p:])),
+                    created_at=np.concatenate((current.created_at[:p], np.full(len(new), now),
+                                               current.created_at[p:])),
+                    qualities=np.concatenate((current.qualities[:p],
+                                              np.asarray(qualities, dtype=np.float32),
+                                              current.qualities[p:])),
+                    lighting=np.concatenate((current.lighting[:p],
+                                             np.asarray([lighting_code(x) for x in lighting],
+                                                        dtype=np.int8),
+                                             current.lighting[p:])),
+                    anchor_files=tuple(files), next_id=current.next_id + len(new))
+            report = BuildReport(len(new), sum(1 for r in results if not r.accepted), results,
+                                 profile.protected_count, profile.learned_count, consistency,
+                                 holdout)
+            if not dry_run:
+                self._install_locked(profile, persist=True)
+                self._pending.clear()
+                self.metrics.record("profile_built", mode=mode, accepted=report.accepted,
+                                    rejected=report.rejected, anchors=report.anchors,
+                                    learned=report.learned, consistency=consistency)
+            return report
 
-    def _prune_pending(self) -> None:
-        cutoff = time.time() - self._PENDING_TTL_S
-        for attempt_id, pending in list(self._pending.items()):
-            if pending.created_at < cutoff:
-                self._pending.pop(attempt_id, None)
-        while len(self._pending) >= self._MAX_PENDING_ATTEMPTS:
-            oldest = min(self._pending, key=lambda key: self._pending[key].created_at)
+    def enroll_from_dir(self, directory: Path = ENROLL_DIR) -> int:
+        """Rebuild the enrollment from every photo in ``directory``."""
+        directory.mkdir(parents=True, exist_ok=True)
+        paths = sorted(p for p in directory.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+        if not paths:
+            raise ValueError(f"No enrollment photos in {directory}")
+        return self.build_profile(paths, mode="replace").accepted
+
+    def map_anchor_files(self, directory: Path = ENROLL_DIR) -> int:
+        """Recover which enrollment photo produced each anchor (legacy profiles)."""
+        profile = self.require_profile()
+        if profile.anchor_files and all(profile.anchor_files):
+            return len(profile.anchor_files)
+        paths = sorted(p for p in directory.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+        names = [""] * profile.protected_count
+        anchors_unit = profile.unit_rows[: profile.protected_count]
+        for path in paths:
+            image = cv2.imread(str(path))
+            if image is None:
+                continue
+            faces = self.embedder.detect(image, min_confidence=ENROLL_MIN_CONFIDENCE)
+            if len(faces) != 1:
+                continue
+            distances = 1.0 - anchors_unit @ unit(self.embedder.embed(faces)[0])
+            index = int(np.argmin(distances))
+            if distances[index] < 1e-3 and not names[index]:
+                names[index] = path.name
+        with self._lock:
+            if self._profile is profile:
+                self._install_locked(profile.with_anchor_files(tuple(names)), persist=True)
+        return sum(1 for n in names if n)
+
+    def profile_health(self) -> dict:
+        """Flag original photos that look unlike the rest (possible poor captures)."""
+        profile = self.require_profile()
+        p = profile.protected_count
+        if p < 4:
+            return {"anchors": p, "outliers": []}
+        anchors = profile.unit_rows[:p]
+        pairwise = 1.0 - anchors @ anchors.T
+        np.fill_diagonal(pairwise, np.nan)
+        typical = np.nanmedian(pairwise, axis=1)
+        q1, q3 = np.percentile(typical, [25, 75])
+        limit = max(0.55, q3 + 1.5 * (q3 - q1))
+        outliers = [{"index": int(i), "file": profile.anchor_files[i] if i < len(
+            profile.anchor_files) else "", "typical_distance": round(float(typical[i]), 3)}
+            for i in np.flatnonzero(typical > limit)]
+        return {"anchors": p, "median_distance": round(float(np.median(typical)), 3),
+                "outlier_limit": round(float(limit), 3), "outliers": outliers}
+
+    def remove_anchors(self, indices: Iterable[int]) -> list[str]:
+        """Remove original photos the user chose to drop; returns their file names."""
+        with self._lock:
+            profile = self.require_profile()
+            drop = {i for i in indices if 0 <= i < profile.protected_count}
+            if not drop or len(drop) >= profile.protected_count:
+                return []
+            removed_files = [profile.anchor_files[i] for i in sorted(drop)
+                             if i < len(profile.anchor_files) and profile.anchor_files[i]]
+            keep_rows = [i for i in range(profile.size) if i not in drop]
+            index = np.asarray(keep_rows)
+            files = [f for i, f in enumerate(profile.anchor_files) if i not in drop]
+            trimmed = FaceProfile.build(
+                profile.embeddings[index], protected_count=profile.protected_count - len(drop),
+                sample_ids=profile.sample_ids[index], sources=profile.sources[index],
+                created_at=profile.created_at[index], qualities=profile.qualities[index],
+                lighting=profile.lighting[index], anchor_files=tuple(files),
+                next_id=profile.next_id)
+            self._install_locked(trimmed, persist=True)
+            self.metrics.record("anchors_removed", count=len(drop))
+            return removed_files or [""] * len(drop)
+
+    # ---- learning ----------------------------------------------------------
+
+    def _prune_pending_locked(self) -> None:
+        cutoff = self._monotonic() - PENDING_TTL_S
+        for attempt, pending in list(self._pending.items()):
+            if pending.created < cutoff:
+                self._pending.pop(attempt, None)
+                self.metrics.record("learning_expired")
+        while len(self._pending) >= MAX_PENDING:
+            oldest = min(self._pending, key=lambda key: self._pending[key].created)
             self._pending.pop(oldest, None)
 
-    def stage_adaptive(self, analyses: list[FrameAnalysis]) -> str | None:
-        """Stage, but do not persist, safe candidates for one face attempt."""
-        if not self.cfg.adaptive_enrollment or self.cfg.adaptive_samples_per_unlock == 0:
+    def stage_learning(self, analyses: list[FrameAnalysis], *,
+                       attempt_id: str | None = None) -> str | None:
+        """Pick the best safe frame of a successful attempt; nothing is saved yet."""
+        cfg = self.cfg
+        if not cfg.adaptive_enrollment or cfg.adaptive_samples_per_unlock <= 0:
             return None
-        if self._refs is None and not self.load():
+        profile = self._profile
+        if profile is None:
             return None
-        assert self._refs is not None
-        protected = self._refs[:self._protected_count]
-        working = self._refs.copy()
-        embeddings: list[np.ndarray] = []
-        qualities: list[float] = []
-        for analysis in analyses:
-            if not analysis.adaptive_eligible or analysis.embedding is None:
-                continue
-            candidate = np.asarray(analysis.embedding, dtype=np.float32)
-            if not is_safe_adaptive_candidate(
-                candidate, protected, working,
-                threshold=self.cfg.threshold,
-                match_margin=self.cfg.adaptive_match_margin,
-                min_diversity=self.cfg.adaptive_min_diversity,
-            ):
-                continue
-            embeddings.append(candidate)
-            qualities.append(float(analysis.quality))
-            working = np.vstack((working, candidate[None, :]))
-            if len(embeddings) >= self.cfg.adaptive_samples_per_unlock:
+        candidates = [
+            LearningCandidate(
+                a.embedding, a.quality.score() if a.quality else 0.0,
+                a.quality.lighting if a.quality else "unknown", a.face_confidence,
+                a.quality.face_ratio if a.quality else 0.0,
+                a.quality.face_sharpness if a.quality else 0.0, a.is_real, a.face_count)
+            for a in analyses if a.match and a.embedding is not None]
+        chosen, photos = self._choose(candidates, profile, analyses)
+        if not chosen:
+            reasons = [c.rejected for c in candidates if c.rejected]
+            reason = max(set(reasons), key=reasons.count) if reasons else "no matching frame"
+            self.metrics.record("learning_skipped", reason=reason, frames=len(candidates))
+            return None
+        with self._lock:
+            self._prune_pending_locked()
+            attempt = attempt_id or secrets.token_urlsafe(18)
+            self._pending[attempt] = _Pending(self._monotonic(), attempt, chosen, photos)
+        self.metrics.record("learning_staged", quality=chosen[0].quality,
+                            novelty=chosen[0].novelty, anchor_distance=chosen[0].anchor_distance)
+        return attempt
+
+    def _choose(self, candidates: list[LearningCandidate], profile: FaceProfile,
+                analyses: list[FrameAnalysis]
+                ) -> tuple[list[LearningCandidate], list[np.ndarray | None]]:
+        cfg = self.cfg
+        anchors = profile.unit_rows[: profile.protected_count]
+        stored = profile.unit_rows
+        chosen: list[LearningCandidate] = []
+        photos: list[np.ndarray | None] = []
+        crops = {id(a.embedding): a.face_crop for a in analyses if a.embedding is not None}
+        remaining = list(candidates)
+        for _ in range(cfg.adaptive_samples_per_unlock):
+            best = choose_learning_sample(
+                remaining, anchors, stored, threshold=self.threshold,
+                match_margin=cfg.adaptive_match_margin, min_diversity=cfg.adaptive_min_diversity,
+                min_face_confidence=cfg.adaptive_min_face_confidence,
+                min_face_ratio=cfg.adaptive_min_face_area_ratio,
+                min_sharpness=cfg.adaptive_min_blur)
+            if best is None:
                 break
-        if not embeddings:
-            return None
-        self._prune_pending()
-        attempt_id = secrets.token_urlsafe(18)
-        self._pending[attempt_id] = _PendingAdaptive(time.time(), embeddings, qualities)
-        return attempt_id
+            chosen.append(best)
+            photos.append(crops.get(id(best.embedding)) if cfg.adaptive_keep_photos else None)
+            stored = np.vstack((stored, unit(best.embedding)[None, :]))
+            remaining = [c for c in remaining if c is not best]
+        return chosen, photos
 
-    def finish_adaptive(self, attempt_id: str, accepted: bool) -> int:
-        """Commit staged samples only after Windows reports authentication success."""
-        self._prune_pending()
-        pending = self._pending.pop(attempt_id, None)
-        if pending is None or not accepted:
-            return 0
-        if self._refs is None and not self.load():
-            return 0
-        assert self._refs is not None
-        now = time.time()
-        retention_changed = self._apply_adaptive_retention(now, persist=False)
-        assert self._refs is not None
-        protected = self._refs[:self._protected_count]
-        refs = self._refs.copy()
-        qualities = self._qualities.copy()
-        created_at = self._created_at.copy()
-        added = 0
-        for candidate, quality in zip(pending.embeddings, pending.qualities):
-            if not is_safe_adaptive_candidate(
-                candidate, protected, refs,
-                threshold=self.cfg.threshold,
-                match_margin=self.cfg.adaptive_match_margin,
-                min_diversity=self.cfg.adaptive_min_diversity,
-            ):
-                continue
-            refs = np.vstack((refs, candidate[None, :]))
-            qualities = np.append(qualities, np.float32(quality))
-            created_at = np.append(created_at, np.float64(now))
-            added += 1
-        if not added:
-            if retention_changed:
-                self._atomic_save_profile(
-                    refs, self._protected_count, qualities, created_at
-                )
-            return 0
+    def finish_learning(self, attempt: str, accepted: bool) -> LearnResult:
+        """Commit a staged sample only after Windows confirmed the sign-in."""
+        with self._lock:
+            self._prune_pending_locked()
+            pending = self._pending.pop(attempt, None)
+            if pending is None:
+                self.metrics.record("learning_result", accepted=accepted, added=0,
+                                    reason="unknown, late, or repeated report")
+                return LearnResult(0, "unknown, late, or repeated report")
+            if not accepted:
+                self.metrics.record("learning_result", accepted=False, added=0,
+                                    reason="Windows did not accept the sign-in")
+                return LearnResult(0, "Windows did not accept the sign-in")
+            profile = self._profile
+            if profile is None:
+                return LearnResult(0, "no profile")
+            # The profile may have changed since staging; re-check safety.
+            survivors, photos = [], []
+            for candidate, photo in zip(pending.candidates, pending.photos, strict=True):
+                check = choose_learning_sample(
+                    [LearningCandidate(candidate.embedding, candidate.quality,
+                                       candidate.lighting, candidate.face_confidence,
+                                       candidate.face_ratio, candidate.sharpness,
+                                       candidate.is_real, candidate.face_count)],
+                    profile.unit_rows[: profile.protected_count], profile.unit_rows,
+                    threshold=self.threshold, match_margin=self.cfg.adaptive_match_margin,
+                    min_diversity=self.cfg.adaptive_min_diversity,
+                    min_face_confidence=self.cfg.adaptive_min_face_confidence,
+                    min_face_ratio=self.cfg.adaptive_min_face_area_ratio,
+                    min_sharpness=self.cfg.adaptive_min_blur)
+                if check is not None:
+                    survivors.append(check)
+                    photos.append(photo)
+            if not survivors:
+                self.metrics.record("learning_result", accepted=True, added=0,
+                                    reason="no longer distinct from stored samples")
+                return LearnResult(0, "no longer distinct from stored samples")
+            updated, ids = profile.append(
+                np.stack([c.embedding for c in survivors]), source=SOURCE_UNLOCK,
+                created_at=self._clock(),
+                qualities=np.asarray([c.quality for c in survivors], dtype=np.float32),
+                lighting=np.asarray([lighting_code(c.lighting) for c in survivors],
+                                    dtype=np.int8))
+            self._install_locked(updated, persist=False)
+            self._apply_retention_locked(persist=False)
+            save_profile(self._profile, self.profile_path)  # type: ignore[arg-type]
+            for candidate, sample_id in zip(survivors, ids, strict=True):
+                self.metrics.record(
+                    "learned_sample", sample_id=sample_id, quality=candidate.quality,
+                    anchor_distance=candidate.anchor_distance, novelty=candidate.novelty,
+                    lighting=candidate.lighting)
+            for photo, sample_id in zip(photos, ids, strict=True):
+                if photo is not None:
+                    self._save_photo(photo, sample_id)
+            self.metrics.record("learning_result", accepted=True, added=len(ids),
+                                reason="learned")
+            return LearnResult(len(ids), "learned", ids)
 
-        adaptive = refs[self._protected_count:]
-        adaptive_qualities = qualities[self._protected_count:]
-        adaptive_created = created_at[self._protected_count:]
-        retention_seconds = self.cfg.adaptive_retention_days * 24.0 * 60.0 * 60.0
-        cutoff = -float("inf") if retention_seconds == 0.0 else now - retention_seconds
-        chosen = select_rolling_adaptive_indices(
-            adaptive,
-            adaptive_qualities,
-            adaptive_created,
-            limit=self.cfg.adaptive_max_embeddings,
-            cutoff=cutoff,
-        )
-        final_refs = protected.copy()
-        final_qualities = qualities[:self._protected_count].copy()
-        final_created = created_at[:self._protected_count].copy()
-        if chosen:
-            final_refs = np.vstack((final_refs, adaptive[chosen]))
-            final_qualities = np.concatenate((final_qualities, adaptive_qualities[chosen]))
-            final_created = np.concatenate((final_created, adaptive_created[chosen]))
-        self._atomic_save_profile(
-            final_refs, self._protected_count, final_qualities, final_created
-        )
-        self._install_profile(
-            final_refs, self._protected_count, final_qualities, final_created
-        )
-        return added
+    def _save_photo(self, crop: np.ndarray, sample_id: int) -> None:
+        try:
+            LEARNED_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(LEARNED_PHOTOS_DIR / f"sample-{sample_id}.jpg"), crop)
+            photos = sorted(LEARNED_PHOTOS_DIR.glob("sample-*.jpg"),
+                            key=lambda p: p.stat().st_mtime)
+            for old in photos[: max(0, len(photos) - self.cfg.adaptive_photo_limit)]:
+                old.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("learned photo not saved: %s", exc)
+
+    def undo_learning(self, *, since: float | None = None,
+                      sample_ids: Iterable[int] | None = None) -> int:
+        """Remove learned samples by id or learned after ``since``."""
+        with self._lock:
+            profile = self.require_profile()
+            p = profile.protected_count
+            learned = range(p, profile.size)
+            if sample_ids is not None:
+                targets = {int(i) for i in sample_ids}
+            elif since is not None:
+                targets = {int(profile.sample_ids[i]) for i in learned
+                           if profile.created_at[i] >= since and profile.sources[i] != SOURCE_MANUAL}
+            else:
+                return 0
+            updated = profile.without_ids(targets)
+            removed = profile.size - updated.size
+            if removed:
+                self._install_locked(updated, persist=True)
+                self.metrics.record("learning_undone", count=removed)
+            return removed
+
+    def reset_learning(self) -> int:
+        """Remove every learned sample; the original enrollment is untouched."""
+        with self._lock:
+            profile = self.require_profile()
+            removed = profile.learned_count
+            if removed:
+                self._install_locked(profile.keep_learned([]), persist=True)
+                self.metrics.record("learning_reset", count=removed)
+            for photo in LEARNED_PHOTOS_DIR.glob("sample-*.jpg"):
+                photo.unlink(missing_ok=True)
+            self._pending.clear()
+            return removed
+
+    def learned_samples(self, limit: int = 50) -> list[dict]:
+        """Newest learned samples, without any biometric data."""
+        profile = self._profile
+        if profile is None:
+            return []
+        rows = range(profile.protected_count, profile.size)
+        items = [{"id": int(profile.sample_ids[i]), "at": float(profile.created_at[i]),
+                  "quality": round(float(profile.qualities[i]), 3),
+                  "source": int(profile.sources[i]),
+                  "lighting": int(profile.lighting[i])} for i in rows]
+        items.sort(key=lambda item: item["at"], reverse=True)
+        return items[:limit]
+
+
+__all__ = ["Outcome", "FrameAnalysis", "Recognizer", "NotEnrolledError", "LearnResult",
+           "BuildReport", "ImageResult", "SOURCE_MANUAL", "SOURCE_ENROLLMENT"]

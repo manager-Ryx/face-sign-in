@@ -7,6 +7,7 @@ Usage:
   python -m tools.set_password --clear
 """
 from __future__ import annotations
+
 import argparse
 import getpass
 import os

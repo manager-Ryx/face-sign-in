@@ -6,13 +6,12 @@ as that same user. For a higher security bar you would use a TPM-backed
 Credential Manager entry.
 """
 from __future__ import annotations
+
 import json
-from pathlib import Path
 
 import win32crypt  # type: ignore
 
 from .config import CREDS_PATH
-
 
 ENTROPY = b"face-unlock:v1"
 

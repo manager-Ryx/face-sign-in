@@ -14,6 +14,8 @@ build/
 
 # Generated / user-specific
 credential_provider/build/
+credential_provider/build-next/
+credential_provider/installed/
 *.npz
 embeddings.npz
 enroll/

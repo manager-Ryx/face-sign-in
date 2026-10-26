@@ -15,10 +15,11 @@ Keys are namespaced by surface: ``tray.*``, ``status.*``, ``settings.*``,
 ``field.<config-name>`` and ``field.<config-name>.desc``, ``lang.<code>``.
 """
 from __future__ import annotations
+
 import locale
 import logging
 import threading
-from typing import Iterable
+from collections.abc import Iterable
 
 log = logging.getLogger(__name__)
 

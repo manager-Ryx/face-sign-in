@@ -1,0 +1,20 @@
+[project]
+name = "windows-face-unlock"
+requires-python = ">=3.11"
+description = "Face sign-in and walk-away locking for Windows"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "build", "dist", "credential_provider/build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "I"]
+ignore = [
+    "E501",    # long strings in user-facing text are clearer unbroken
+    "SIM105",  # explicit try/except/pass reads better around Win32 calls
+    "SIM108",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["face_service", "presence_monitor", "tools"]

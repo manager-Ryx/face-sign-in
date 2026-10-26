@@ -1,6 +1,7 @@
 #include "FaceCredentialProvider.h"
 #include "FaceCredential.h"
 #include "PipeClient.h"
+#include "dll.h"
 #include "helpers.h"
 #include <algorithm>
 #include <new>
@@ -18,7 +19,9 @@ FaceCredentialProvider::FaceCredentialProvider()
     : m_cRef(1), m_cpus(CPUS_INVALID), m_pCred(nullptr), m_pEvents(nullptr),
       m_adviseContext(0),
       m_stopEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
-      m_workerActive(false), m_lastRearmTick(0) {}
+      m_workerActive(false), m_lastRearmTick(0) {
+    DllAddRef();
+}
 
 FaceCredentialProvider::~FaceCredentialProvider() {
     UnAdvise();
@@ -35,6 +38,7 @@ FaceCredentialProvider::~FaceCredentialProvider() {
         CloseHandle(m_stopEvent);
         m_stopEvent = nullptr;
     }
+    DllRelease();
 }
 
 IFACEMETHODIMP FaceCredentialProvider::QueryInterface(REFIID riid, void** ppv) {
@@ -112,9 +116,16 @@ IFACEMETHODIMP FaceCredentialProvider::Advise(ICredentialProviderEvents* events,
 
 IFACEMETHODIMP FaceCredentialProvider::UnAdvise() {
     if (m_stopEvent) SetEvent(m_stopEvent);
-    if (m_worker.joinable() &&
-        m_worker.get_id() != std::this_thread::get_id()) {
-        m_worker.join();
+    if (m_worker.joinable()) {
+        if (m_worker.get_id() != std::this_thread::get_id()) {
+            m_worker.join();
+        } else {
+            // Called from the worker itself (a synchronous CredentialsChanged
+            // callback). It cannot join itself; detach so a later Advise can
+            // start a fresh worker instead of failing with ERROR_BUSY. The
+            // worker keeps its own COM reference until it returns.
+            m_worker.detach();
+        }
     }
     m_workerActive.store(false);
 
