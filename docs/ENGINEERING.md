@@ -31,7 +31,7 @@ From a full read plus an independent review. "Fixed" items have tests.
 
 | Finding | Status |
 |---|---|
-| Any program running as you could ask the pipe for your password while your face was visible | **Mitigated**: caller identity recorded on every request (`unlock_client_check = log`); switch to `enforce` once logs show the sign-in screen is identified as SYSTEM. Same-user malware can still decrypt DPAPI directly – inherent to the design. |
+| Any program running as you could ask the pipe for your password while your face was visible | **Fixed**: only the Windows sign-in screen, identified as SYSTEM, may request it (`unlock_client_check = enforce`, the default since live sign-ins confirmed the identification; tested). Same-user malware can still decrypt DPAPI directly – inherent to the design. |
 | Pipe accept loop could be stalled by one silent client; shutdown hung; client reads had no timeout | **Fixed** (overlapped I/O with deadlines; tested) |
 | Config never validated at start-up (e.g. `threshold = 1.9` accepted any face) | **Fixed** (typed, bounded loading with last-known-good fallback; tested) |
 | `pause_camera` unbounded (could disable auto-lock forever) | **Fixed** (≤ 10 min, renewable lease; tested) |
@@ -78,8 +78,8 @@ From a full read plus an independent review. "Fixed" items have tests.
    defined).
 4. **Architecture.** For enterprise customers, run the matching service as a
    Windows service, keep the secret out of user mode (or replace password
-   replay with certificate-based logon), verify the pipe server from the tile,
-   and enforce the caller check.
+   replay with certificate-based logon), and verify the pipe server from the
+   tile (the service already refuses callers other than the sign-in screen).
 5. **Privacy and consent.** Biometric data (GDPR Art. 9, Illinois BIPA, Texas
    CUBI): EULA, privacy notice, explicit consent at setup, retention policy and
    deletion – the app already stores everything locally and offers reset.

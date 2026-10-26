@@ -154,8 +154,8 @@ class Config:
     unlock_pause_when_display_off: bool = _setting(
         True, P, "Stop using the camera while the screen is off on the lock screen.")
     unlock_client_check: str = _setting(
-        "log", S, "Verify that only the Windows sign-in screen can request your "
-        "credentials ('log' records the caller, 'enforce' refuses others).",
+        "enforce", S, "Only the Windows sign-in screen may request your credentials "
+        "('enforce'); 'log' lets other programs ask but records them; 'off' skips the check.",
         choices=CLIENT_CHECK_MODES)
 
     # --- learning ----------------------------------------------------------

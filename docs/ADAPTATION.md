@@ -210,7 +210,7 @@ Generated from the code (`face_service/config.py`).
 | `unlock_idle_interval_s` | You decide | `10.0` | 3-20 | Seconds between quick checks once lock-screen scanning has slowed down. |
 | `unlock_learn_routine` | You decide | `True` |  | Learn when you usually come back to a locked PC and scan continuously then (uses only lock and sign-in times, kept as counts on this PC). |
 | `unlock_pause_when_display_off` | You decide | `True` |  | Stop using the camera while the screen is off on the lock screen. |
-| `unlock_client_check` | Safeguard (never changes silently) | `log` | off, log, enforce | Verify that only the Windows sign-in screen can request your credentials ('log' records the caller, 'enforce' refuses others). |
+| `unlock_client_check` | Safeguard (never changes silently) | `enforce` | off, log, enforce | Only the Windows sign-in screen may request your credentials ('enforce'); 'log' lets other programs ask but records them; 'off' skips the check. |
 | `adaptive_enrollment` | You decide | `False` |  | Learn your current appearance from confirmed face sign-ins. |
 | `adaptive_samples_per_unlock` | Safeguard (never changes silently) | `1` | 0-2 | Most face samples learned from one confirmed sign-in. |
 | `adaptive_max_embeddings` | You decide | `300` | 1-2000 | Most learned samples kept, in addition to your original enrollment. |

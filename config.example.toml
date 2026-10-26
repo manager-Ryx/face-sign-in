@@ -30,7 +30,7 @@ unlock_idle_after_s = 60.0      # continuous scanning after you leave (until a r
 unlock_idle_interval_s = 10.0   # seconds between quick looks otherwise
 unlock_learn_routine = true     # scan continuously when you usually come back (counts only)
 unlock_pause_when_display_off = true
-unlock_client_check = "log"     # "enforce": only the sign-in screen may request the password
+unlock_client_check = "enforce" # only the sign-in screen may request the password ("log" records others)
 
 # --- Learning ----------------------------------------------------------------
 # Learns only from face sign-ins Windows confirmed; stores face signatures,

@@ -116,6 +116,7 @@ class ConfigRulesTests(unittest.TestCase):
         self.assertFalse(cfg.auto_tighten_threshold)
         self.assertFalse(cfg.absence_learning)
         self.assertFalse(cfg.adaptive_lock)
+        self.assertEqual(cfg.unlock_client_check, "enforce")  # only the sign-in screen
 
 
 if __name__ == "__main__":
