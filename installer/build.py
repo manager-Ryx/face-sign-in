@@ -14,6 +14,7 @@ Intended to run both locally and in CI. Environment:
                      Visual Studio + CMake aren't available)
 """
 from __future__ import annotations
+
 import hashlib
 import os
 import shutil

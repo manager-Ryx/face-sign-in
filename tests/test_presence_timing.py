@@ -3,8 +3,13 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import _isolation  # noqa: F401
+
 from face_service.config import Config
 from presence_monitor.monitor import AbsenceTimer, PresenceMonitor
+
+PRESENT = {"ok": True, "present": True, "mode": "recognition"}
+ABSENT = {"ok": True, "present": False, "mode": "recognition", "outcome": "no_face"}
 
 
 class FakeClock:
@@ -19,23 +24,16 @@ class AbsenceTimerTests(unittest.TestCase):
     def test_does_not_fire_before_timeout_and_fires_at_timeout(self) -> None:
         clock = FakeClock()
         timer = AbsenceTimer(600, clock)
-
         timer.mark_present()
         for second in (120, 240, 360, 480):
             clock.now = second
-            elapsed, expired = timer.mark_absent()
-            self.assertEqual(elapsed, second)
-            self.assertFalse(expired)
-
+            self.assertEqual(timer.mark_absent(), (second, False))
         clock.now = 600
-        elapsed, expired = timer.mark_absent()
-        self.assertEqual(elapsed, 600)
-        self.assertTrue(expired)
+        self.assertEqual(timer.mark_absent(), (600, True))
 
     def test_present_match_restarts_elapsed_time(self) -> None:
         clock = FakeClock()
         timer = AbsenceTimer(600, clock)
-
         timer.mark_present()
         clock.now = 480
         self.assertEqual(timer.mark_absent(), (480, False))
@@ -48,86 +46,76 @@ class AbsenceTimerTests(unittest.TestCase):
     def test_reset_requires_a_new_full_absence_window(self) -> None:
         clock = FakeClock()
         timer = AbsenceTimer(600, clock)
-
         timer.mark_present()
         clock.now = 480
-        self.assertEqual(timer.mark_absent(), (480, False))
+        timer.mark_absent()
         timer.reset()
         clock.now = 600
         self.assertEqual(timer.mark_absent(), (0, False))
 
 
-class PresenceMonitorPolicyTests(unittest.TestCase):
+class PresenceMonitorTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.cfg = Config(
-            presence_interval_s=120,
-            presence_absence_timeout_s=600,
-            presence_mode="recognition",
-        )
-        self.monitor = PresenceMonitor(self.cfg)
+        self.cfg = Config(presence_interval_s=120, presence_absence_timeout_s=600)
+        self.locked = [False]
+        self.wall = FakeClock(1_000_000.0)
+        self.monitor = PresenceMonitor(self.cfg, locked=lambda: self.locked[0], clock=self.wall)
         self.clock = FakeClock()
         self.monitor._absence.clock = self.clock
+        self.remote = patch("presence_monitor.monitor.is_remote_context",
+                            return_value=(False, ""))
+        self.remote.start()
 
-    def test_120_second_probes_lock_once_at_ten_minutes(self) -> None:
-        responses = iter(
-            [{"ok": True, "present": True, "real": True, "mode": "recognition"}]
-            + [
-                {"ok": True, "present": False, "real": False, "mode": "recognition"}
-                for _ in range(5)
-            ]
-        )
-        with (
-            patch("presence_monitor.monitor.is_remote_context", return_value=(False, "")),
-            patch("presence_monitor.monitor.pipe_call", side_effect=lambda *a, **k: next(responses)),
-            patch("presence_monitor.monitor._lock_workstation") as lock,
-        ):
-            self.monitor._tick()
-            for second in (120, 240, 360, 480):
+    def tearDown(self) -> None:
+        self.remote.stop()
+
+    def run_ticks(self, responses: list, times: list[float]):
+        replies = iter(responses)
+        with patch("presence_monitor.monitor.pipe_call", side_effect=lambda *a, **k: next(replies)), \
+                patch("presence_monitor.monitor._lock_workstation") as lock:
+            for second in times:
                 self.clock.now = second
                 self.monitor._tick()
-                lock.assert_not_called()
+        return lock
 
-            self.clock.now = 600
-            self.monitor._tick()
-            lock.assert_called_once_with()
+    def test_120_second_checks_lock_once_at_ten_minutes(self) -> None:
+        lock = self.run_ticks([PRESENT] + [ABSENT] * 5, [0, 120, 240, 360, 480, 600])
+        lock.assert_called_once_with()
 
     def test_service_error_cancels_pending_absence_for_safety(self) -> None:
-        responses = iter(
-            [
-                {"ok": True, "present": True, "real": True, "mode": "recognition"},
-                {"ok": True, "present": False, "real": False, "mode": "recognition"},
-                None,
-                {"ok": True, "present": False, "real": False, "mode": "recognition"},
-                {"ok": True, "present": False, "real": False, "mode": "recognition"},
-            ]
-        )
-        with (
-            patch("presence_monitor.monitor.is_remote_context", return_value=(False, "")),
-            patch("presence_monitor.monitor.pipe_call", side_effect=lambda *a, **k: next(responses)),
-            patch("presence_monitor.monitor._lock_workstation") as lock,
-        ):
-            self.monitor._tick()
-            self.clock.now = 480
-            self.monitor._tick()
-            self.clock.now = 600
-            self.monitor._tick()
-            self.clock.now = 720
-            self.monitor._tick()
-            self.clock.now = 1200
-            self.monitor._tick()
-            lock.assert_not_called()
+        lock = self.run_ticks([PRESENT, ABSENT, None, ABSENT, ABSENT], [0, 480, 600, 720, 1200])
+        lock.assert_not_called()
 
+    def test_missing_profile_never_counts_as_absence(self) -> None:
+        not_ready = {"ok": False, "reason": "not-enrolled"}
+        lock = self.run_ticks([PRESENT] + [not_ready] * 6, [0, 120, 240, 360, 480, 600, 720])
+        lock.assert_not_called()
+        self.assertEqual(self.monitor.snapshot()["last_result"], "error")
 
-class ConfigCompatibilityTests(unittest.TestCase):
-    def test_legacy_strikes_are_only_the_zero_timeout_fallback(self) -> None:
-        legacy = Config(presence_interval_s=60, presence_absent_strikes=3)
-        explicit = Config(
-            presence_interval_s=120,
-            presence_absent_strikes=99,
-            presence_absence_timeout_s=600,
-        )
-        self.assertEqual(legacy.effective_presence_absence_timeout_s, 180)
-        self.assertEqual(explicit.effective_presence_absence_timeout_s, 600)
+    def test_skipped_checks_are_inconclusive(self) -> None:
+        skipped = {"ok": True, "present": True, "skipped": "camera-leased"}
+        lock = self.run_ticks([PRESENT, ABSENT, ABSENT, skipped, ABSENT, ABSENT],
+                              [0, 120, 480, 540, 600, 700])
+        lock.assert_not_called()
+
+    def test_no_checks_while_windows_is_locked(self) -> None:
+        self.locked[0] = True
+        with patch("presence_monitor.monitor.pipe_call") as call:
+            self.monitor._tick()
+        call.assert_not_called()
+        self.assertEqual(self.monitor.snapshot()["last_reason"], "locked")
+
+    def test_timed_pause_expires(self) -> None:
+        self.monitor.pause(600)
+        self.assertTrue(self.monitor.is_paused())
+        self.wall.now += 601
+        self.assertFalse(self.monitor.is_paused())
+
+    def test_unlock_event_restarts_the_absence_window(self) -> None:
+        self.run_ticks([PRESENT, ABSENT], [0, 480])
+        self.monitor.on_session_event("unlock", {})
+        lock = self.run_ticks([ABSENT, ABSENT], [600, 700])
+        lock.assert_not_called()
 
 
 if __name__ == "__main__":

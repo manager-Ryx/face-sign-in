@@ -1,17 +1,27 @@
+"""Walk-away locking: periodically check that you are still at the PC.
+
+The workstation is locked only after an uninterrupted absence of the
+configured length. Anything inconclusive – the service being unavailable, a
+camera problem, no face profile, the camera lent to the setup window, a
+remote session – cancels the absence timer instead of counting towards it,
+so a fault can never cause a blind lock. Checks are skipped entirely while
+Windows is already locked; the sign-in screen has its own face scanning.
+"""
 from __future__ import annotations
-import json
+
+import ctypes
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
-import ctypes
-import pywintypes  # type: ignore
-import win32file  # type: ignore
+from face_service import pipe
+from face_service.config import PIPE_NAME, Config
+from face_service.metrics import MetricsStore, NullMetrics
+from face_service.win_events import is_session_locked
 
-from face_service.config import Config, PIPE_NAME
-
+from .absence import AbsenceModel
 from .remote_session import is_remote_context
 
 log = logging.getLogger(__name__)
@@ -21,62 +31,18 @@ def _lock_workstation() -> None:
     ctypes.windll.user32.LockWorkStation()
 
 
-def _get_idle_seconds() -> float:
-    """Seconds since last user input (keyboard/mouse)."""
-    class LASTINPUTINFO(ctypes.Structure):
-        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-    lii = LASTINPUTINFO()
-    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-        return 0.0
-    tick = ctypes.windll.kernel32.GetTickCount()
-    return (tick - lii.dwTime) / 1000.0
-
-
-def pipe_call(req: dict, timeout_s: float = 30.0) -> dict | None:
-    """Send a JSON request to the FaceService pipe and return the response."""
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        try:
-            handle = win32file.CreateFile(
-                PIPE_NAME,
-                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0, None, win32file.OPEN_EXISTING, 0, None,
-            )
-            break
-        except pywintypes.error:
-            time.sleep(0.2)
-    else:
-        log.warning("FaceService pipe not available")
-        return None
-
-    try:
-        win32file.WriteFile(handle, (json.dumps(req) + "\n").encode("utf-8"))
-        _hr, data = win32file.ReadFile(handle, 65536)
-        return json.loads(data.decode("utf-8").strip())
-    except Exception as e:
-        log.warning("pipe call failed: %s", e)
-        return None
-    finally:
-        try:
-            win32file.CloseHandle(handle)
-        except Exception:
-            pass
-
-
-# Backwards-compat alias
-_pipe_call = pipe_call
+def pipe_call(request: dict, timeout_s: float = 10.0) -> dict | None:
+    """Send one request to FaceService; ``None`` if it is unavailable or slow."""
+    return pipe.call(PIPE_NAME, request, timeout_s=timeout_s)
 
 
 @dataclass
 class TickSnapshot:
     at: float = 0.0
-    result: str = "-"       # present / absent / skipped / error
+    result: str = "-"         # present / absent / skipped / error
     reason: str = ""
-    strikes: int = 0
+    guidance: str = ""
     absence_elapsed_s: float = 0.0
-    mode: str = ""
 
 
 @dataclass
@@ -84,8 +50,8 @@ class AbsenceTimer:
     """Monotonic timer measuring time since the last successful face match.
 
     A first absent result starts a fresh timer. A present result moves the
-    anchor to that probe time. Inconclusive/skipped results reset the timer so
-    a camera or service failure can never cause a blind lock.
+    anchor to that check. Inconclusive results reset the timer so a camera or
+    service failure can never cause a blind lock.
     """
 
     timeout_s: float
@@ -112,175 +78,226 @@ class AbsenceTimer:
 
 
 class PresenceMonitor:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, *, absence: AbsenceModel | None = None,
+                 metrics: MetricsStore | None = None,
+                 locked: Callable[[], bool | None] = is_session_locked,
+                 clock: Callable[[], float] = time.time):
         self.cfg = cfg
+        self.absence = absence
+        self.metrics = metrics or NullMetrics()
+        self._locked = locked
+        self._clock = clock
         self._stop = threading.Event()
-        self._paused = threading.Event()
+        self._wake = threading.Event()
+        self._paused_until: float | None = None   # inf = until resumed
         self._strikes = 0
         self._absence = AbsenceTimer(cfg.effective_presence_absence_timeout_s)
         self._last = TickSnapshot()
         self._lock_count = 0
+        self._self_locked_at = 0.0
+        self._timeout_rule = "Your normal lock timeout."
         self._state_lock = threading.Lock()
 
-    def pause(self) -> None:
-        self._paused.set()
+    # ---- control -----------------------------------------------------------
+
+    def pause(self, seconds: float | None = None) -> None:
+        """Pause checks for ``seconds`` (``None`` = until resumed)."""
+        with self._state_lock:
+            self._paused_until = float("inf") if seconds is None else self._clock() + seconds
         self._reset_absence()
-        log.info("presence monitor paused")
+        log.info("presence checks paused %s", "until resumed" if seconds is None
+                 else f"for {seconds / 60:.0f} min")
 
     def resume(self) -> None:
-        self._paused.clear()
+        with self._state_lock:
+            self._paused_until = None
         self._reset_absence()
-        log.info("presence monitor resumed")
+        log.info("presence checks resumed")
+        self._wake.set()
 
     def is_paused(self) -> bool:
-        return self._paused.is_set()
+        with self._state_lock:
+            until = self._paused_until
+            if until is not None and self._clock() >= until:
+                self._paused_until = None
+                until = None
+        return until is not None
+
+    @property
+    def paused_until(self) -> float | None:
+        with self._state_lock:
+            return self._paused_until
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
+
+    def check_soon(self) -> None:
+        """Run the next check now instead of waiting for the interval."""
+        self._wake.set()
 
     def reload_config(self, cfg: Config) -> None:
         self.cfg = cfg
-        self._absence = AbsenceTimer(cfg.effective_presence_absence_timeout_s)
+        self._absence = AbsenceTimer(cfg.effective_presence_absence_timeout_s,
+                                     self._absence.clock)
         self._strikes = 0
-        log.info(
-            "presence monitor config reloaded: interval=%ss timeout=%ss mode=%s",
-            cfg.presence_interval_s,
-            cfg.effective_presence_absence_timeout_s,
-            cfg.presence_mode,
-        )
+        log.info("presence monitor settings: every %ss, lock after %ss, mode=%s",
+                 cfg.presence_interval_s, cfg.effective_presence_absence_timeout_s,
+                 cfg.presence_mode)
+
+    # ---- state -------------------------------------------------------------
+
+    def _timeout(self) -> int:
+        base = self.cfg.effective_presence_absence_timeout_s
+        if self.cfg.adaptive_lock and self.absence is not None:
+            timeout, rule = self.absence.timeout_for(
+                self._clock(), base_timeout_s=base,
+                minimum_s=self.cfg.adaptive_lock_min_timeout_s)
+            self._timeout_rule = rule
+            return timeout
+        self._timeout_rule = "Your normal lock timeout."
+        return base
 
     def snapshot(self) -> dict:
         with self._state_lock:
             last = self._last
-            return {
-                "paused": self._paused.is_set(),
-                "strikes": self._strikes,
-                "absence_elapsed_s": last.absence_elapsed_s,
-                "absence_timeout_s": self.cfg.effective_presence_absence_timeout_s,
-                "lock_count": self._lock_count,
-                "last_at": last.at,
-                "last_result": last.result,
-                "last_reason": last.reason,
-                "last_mode": last.mode,
-                "interval_s": self.cfg.presence_interval_s,
-                "absent_strikes": self.cfg.presence_absent_strikes,
-                "mode": self.cfg.presence_mode,
-            }
+            paused_until = self._paused_until
+        return {
+            "paused": self.is_paused(),
+            "paused_until": None if paused_until in (None, float("inf")) else paused_until,
+            "strikes": self._strikes,
+            "absence_elapsed_s": last.absence_elapsed_s,
+            "absence_timeout_s": self._absence.timeout_s,
+            "timeout_rule": self._timeout_rule,
+            "lock_count": self._lock_count,
+            "last_at": last.at,
+            "last_result": last.result,
+            "last_reason": last.reason,
+            "last_guidance": last.guidance,
+            "interval_s": self.cfg.presence_interval_s,
+            "mode": self.cfg.presence_mode,
+        }
 
-    def _set_last(self, result: str, reason: str = "", mode: str = "") -> None:
+    def _set_last(self, result: str, reason: str = "", guidance: str = "") -> None:
         with self._state_lock:
-            self._last = TickSnapshot(
-                at=time.time(),
-                result=result,
-                reason=reason,
-                strikes=self._strikes,
-                absence_elapsed_s=self._absence.elapsed(),
-                mode=mode or self.cfg.presence_mode,
-            )
+            self._last = TickSnapshot(self._clock(), result, reason, guidance or "",
+                                      self._absence.elapsed())
+        self.metrics.record("presence", result=result, reason=reason,
+                            elapsed_s=round(self._absence.elapsed(), 1))
 
     def _reset_absence(self) -> None:
         self._strikes = 0
         self._absence.reset()
 
+    def _learning(self) -> AbsenceModel | None:
+        return self.absence if self.cfg.absence_learning else None
+
+    # ---- session events (from the app's SessionWatcher) ---------------------
+
+    def on_session_event(self, name: str, detail: dict) -> None:
+        learner = self._learning()
+        if name == "lock":
+            self._reset_absence()
+            automatic = self._clock() - self._self_locked_at < 30
+            if learner and not automatic:
+                learner.observe_lock()
+        elif name in ("unlock", "logon"):
+            self._reset_absence()
+            if learner:
+                learner.observe_unlock()
+            self.check_soon()
+        elif name in ("sleep", "remote-connect", "console-disconnect"):
+            self._reset_absence()
+            if learner and name != "sleep":
+                learner.discard_open(name)
+
+    # ---- the check -----------------------------------------------------------
+
     def _tick(self) -> None:
-        # 1. Skip if paused from the tray
-        if self._paused.is_set():
+        learner = self._learning()
+        if not self.cfg.presence_enabled:
+            self._reset_absence()
+            self._set_last("skipped", "off")
+            return
+        if self.is_paused():
             self._reset_absence()
             self._set_last("skipped", "paused")
             return
-
-        # 2. Skip if this is a remote session — face check doesn't make sense
-        #    when nobody is physically at the machine.
-        remote, reason = is_remote_context()
-        if remote:
-            log.info("skip: remote context (%s)", reason)
+        if self.cfg.presence_pause_while_locked and self._locked():
             self._reset_absence()
-            self._set_last("skipped", reason)
+            self._set_last("skipped", "locked")
+            return
+        remote, why = is_remote_context()
+        if remote:
+            log.info("check skipped: remote session (%s)", why)
+            self._reset_absence()
+            if learner:
+                learner.discard_open("remote session")
+            self._set_last("skipped", "remote")
             return
 
-        # NOTE: We deliberately do NOT skip based on keyboard/mouse input.
-        # The goal is pure face-based presence: if the enrolled face is not
-        # in front of the camera, lock — even if someone else is actively
-        # using the machine (stronger "walk-away" security).
-
-        # 3. Probe camera via FaceService
-        resp = pipe_call({"cmd": "presence"}, timeout_s=20.0)
-        if resp is None:
-            # Service down — don't lock blindly
-            log.warning("presence probe: service unavailable; skipping")
+        response = pipe_call({"cmd": "presence"}, timeout_s=25.0)
+        if response is None:
+            log.warning("presence check: service unavailable; not counting as absence")
             self._reset_absence()
             self._set_last("error", "service-unavailable")
             return
-
-        if not resp.get("ok"):
-            log.warning("presence probe failed: %s", resp.get("reason", "unknown"))
+        if not response.get("ok"):
+            reason = str(response.get("reason", "check-failed"))
+            log.warning("presence check failed: %s", reason)
             self._reset_absence()
-            self._set_last("error", str(resp.get("reason", "probe-failed")))
+            if learner and reason.startswith("camera"):
+                learner.discard_open("camera problem")
+            self._set_last("error", reason)
+            return
+        if response.get("skipped"):
+            self._reset_absence()
+            self._set_last("skipped", str(response["skipped"]))
             return
 
-        present = bool(resp.get("present"))
-        mode = resp.get("mode", self.cfg.presence_mode)
-        log.info("presence probe: present=%s real=%s mode=%s",
-                 present, resp.get("real"), mode)
-
+        present = bool(response.get("present"))
+        guidance = str(response.get("guidance") or "")
         if present:
             self._strikes = 0
             self._absence.mark_present()
-            self._set_last("present", f"real={resp.get('real')}", mode)
+            if learner:
+                learner.observe_present()
+            self._set_last("present", str(response.get("outcome", "match")))
             return
 
         self._strikes += 1
-        elapsed, should_lock = self._absence.mark_absent()
-        timeout = self.cfg.effective_presence_absence_timeout_s
-        self._set_last(
-            "absent",
-            f"absent {elapsed:.0f}s/{timeout}s ({self._strikes} probes)",
-            mode,
-        )
-        if should_lock:
-            log.warning("absent %d ticks — locking workstation", self._strikes)
+        elapsed, _ = self._absence.mark_absent()
+        timeout = self._timeout()
+        if learner:
+            learner.observe_absent()
+        self._set_last("absent", str(response.get("outcome", "")), guidance)
+        if elapsed >= timeout:
+            log.warning("no face for about %.0f min; locking the workstation", elapsed / 60)
             self._reset_absence()
-            with self._state_lock:
-                self._lock_count += 1
+            self._lock_count += 1
+            self._self_locked_at = self._clock()
+            self.metrics.record("auto_lock", elapsed_s=round(elapsed, 1), timeout_s=timeout)
             _lock_workstation()
 
     def run(self) -> None:
-        log.info("presence monitor loop: interval=%ss timeout=%ss mode=%s",
-                 self.cfg.presence_interval_s,
-                 self.cfg.effective_presence_absence_timeout_s,
+        log.info("presence checks every %ss; lock after about %ss; mode=%s",
+                 self.cfg.presence_interval_s, self.cfg.effective_presence_absence_timeout_s,
                  self.cfg.presence_mode)
-        next_probe_at = time.monotonic()
+        next_at = time.monotonic()
         while not self._stop.is_set():
             try:
                 self._tick()
             except Exception:
-                log.exception("tick error")
+                log.exception("presence check crashed; not counting as absence")
                 self._reset_absence()
                 self._set_last("error", "exception")
-            # Keep probe starts on a fixed cadence. Camera/model processing time
-            # does not accumulate into the 120-second interval, and a very slow
-            # probe never causes a catch-up burst.
+            # A fixed cadence: slow checks never cause a catch-up burst.
             interval = float(self.cfg.presence_interval_s)
-            next_probe_at += interval
+            next_at += interval
             now = time.monotonic()
-            if next_probe_at <= now:
-                next_probe_at = now + interval
-            self._stop.wait(next_probe_at - now)
-
-
-def main() -> None:
-    from face_service.config import LOG_PATH
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH.with_name("presence.log"), encoding="utf-8"),
-                  logging.StreamHandler()],
-    )
-    cfg = Config.load()
-    from .tray import run_with_tray
-    run_with_tray(cfg)
-
-
-if __name__ == "__main__":
-    main()
+            if next_at <= now:
+                next_at = now + interval
+            self._wake.wait(next_at - now)
+            if self._wake.is_set():
+                self._wake.clear()
+                next_at = time.monotonic()

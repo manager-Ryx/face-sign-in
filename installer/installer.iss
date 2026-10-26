@@ -6,7 +6,7 @@
 
 #define MyAppName "Windows Face Unlock"
 #define MyAppShortName "WindowsFaceUnlock"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "Cao Chi Tam"
 #define MyAppURL "https://github.com/caochitam/windows-face-unlock"
 #define MyAppExeName "face_unlock_tray.exe"
@@ -56,10 +56,11 @@ Source: "{#BuildRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdi
 ; Post-install scripts (task registration etc.) invoked from [Run].
 Source: "postinstall\register_tasks.ps1"; DestDir: "{app}\postinstall"; Flags: ignoreversion
 
-[Dirs]
-; Writable log/config dir in per-user profile — created on first run anyway,
-; but we pre-create it so the uninstaller can optionally wipe it.
-Name: "{userappdata}\..\.face-unlock"; Permissions: users-modify
+; The per-user data folder (%USERPROFILE%\.face-unlock) is created by the app
+; itself on first run, inside the right user's profile with that user's
+; default permissions. (An earlier [Dirs] entry created a stray folder under
+; AppData with "users-modify" rights, which would let other local users edit
+; the face profile and settings.)
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -76,13 +77,14 @@ Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: 
 Filename: "regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
   Tasks: cp; StatusMsg: "Registering Credential Provider…"; Flags: runhidden
 
-; 2. Create scheduled tasks pointing to the installed executables.
+; 2. Create the per-user sign-in tasks as the user who started Setup (not the
+;    elevated account), so they run in that user's session and profile.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Service ""{app}\{#MyServiceExe}"" -Tray ""{app}\{#MyAppExeName}"""; \
-  StatusMsg: "Registering scheduled tasks…"; Flags: runhidden
+  StatusMsg: "Registering scheduled tasks…"; Flags: runhidden runasoriginaluser
 
-; 3. Kick off the tray right away so the user has the systray icon.
-Filename: "schtasks.exe"; Parameters: "/Run /TN ""\FaceUnlock-Service"""; Flags: runhidden skipifsilent
-Filename: "schtasks.exe"; Parameters: "/Run /TN ""\FaceUnlock-Presence"""; Flags: runhidden skipifsilent
+; 3. Kick off the service and tray right away.
+Filename: "schtasks.exe"; Parameters: "/Run /TN ""\FaceUnlock-Service"""; Flags: runhidden skipifsilent runasoriginaluser
+Filename: "schtasks.exe"; Parameters: "/Run /TN ""\FaceUnlock-Presence"""; Flags: runhidden skipifsilent runasoriginaluser
 
 ; 4. Post-install: if we started under SILENT (autoupdate), re-launch the tray.
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; \

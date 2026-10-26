@@ -1,60 +1,50 @@
-"""Detect remote-access contexts so the presence monitor can skip auto-lock.
+"""Detect remote-access sessions so the presence monitor never locks during one.
 
-Two tiers of detection:
+Two tiers:
 
-1. ALWAYS_REMOTE_PROCS — processes that only exist while a remote session is
-   *currently connected* (e.g. TeamViewer_Desktop.exe, Quick Assist).
-   Seeing them is enough to treat as remote.
+1. ``ALWAYS_REMOTE_PROCS`` – processes that exist only while a remote session
+   is connected (for example ``TeamViewer_Desktop.exe`` or Quick Assist).
+2. ``CONNECTION_CHECKED_PROCS`` – helpers that run all the time and only mean
+   "remote session active" while they hold an established TCP connection to
+   another machine (AnyDesk, RustDesk, Parsec, ...).
 
-2. CONNECTION_CHECKED_PROCS — processes that run persistently (tray / service)
-   and only mean "active remote" when they hold an ESTABLISHED TCP connection
-   to a non-loopback peer (UltraViewer, AnyDesk, RustDesk, Parsec, ...).
-
-Also: RDP session via GetSystemMetrics(SM_REMOTESESSION).
+Connections are read from the system-wide table once per check, which also
+works for helpers running under another account (their per-process
+connection lists would be access-denied). An RDP session is detected with
+``GetSystemMetrics(SM_REMOTESESSION)``.
 """
 from __future__ import annotations
+
 import ipaddress
 import logging
 
 try:
-    import psutil  # optional but recommended
-except ImportError:
-    psutil = None  # type: ignore
+    import psutil
+except ImportError:  # pragma: no cover - psutil is a declared dependency
+    psutil = None  # type: ignore[assignment]
 
-import win32api  # type: ignore
+import win32api
 
 log = logging.getLogger(__name__)
 
-# Always indicate an active remote connection on sight.
 ALWAYS_REMOTE_PROCS = {
-    "teamviewer_desktop.exe",      # TeamViewer spawns this on connect
-    "remoting_desktop.exe",        # Chrome Remote Desktop (per-connection)
-    "quickassist.exe",             # Microsoft Quick Assist
-    "msra.exe",                    # Windows Remote Assistance
+    "teamviewer_desktop.exe",   # TeamViewer spawns this on connect
+    "remoting_desktop.exe",     # Chrome Remote Desktop (per connection)
+    "quickassist.exe",          # Microsoft Quick Assist
+    "msra.exe",                 # Windows Remote Assistance
 }
 
-# Tray/service processes that run all the time; only treat as active when
-# they hold an ESTABLISHED external TCP connection.
 CONNECTION_CHECKED_PROCS = {
-    "ultraviewer_desktop.exe",
-    "ultraviewer_service.exe",
-    "anydesk.exe",
-    "rustdesk.exe",
-    "remoting_host.exe",           # Chrome Remote Desktop host
-    "parsecd.exe",
-    "sunshine.exe",
-    "srserver.exe",                # Splashtop
-    "teamviewer.exe",              # full idle tray (checked via connection)
+    "ultraviewer_desktop.exe", "ultraviewer_service.exe", "anydesk.exe", "rustdesk.exe",
+    "remoting_host.exe", "parsecd.exe", "sunshine.exe", "srserver.exe", "teamviewer.exe",
 }
 
 SM_REMOTESESSION = 0x1000
 
 
-def _is_external(addr: str) -> bool:
-    if not addr:
-        return False
+def _is_external(address: str) -> bool:
     try:
-        ip = ipaddress.ip_address(addr)
+        ip = ipaddress.ip_address(address)
     except ValueError:
         return False
     return not (ip.is_loopback or ip.is_unspecified or ip.is_link_local)
@@ -63,36 +53,35 @@ def _is_external(addr: str) -> bool:
 def is_rdp_session() -> bool:
     try:
         return bool(win32api.GetSystemMetrics(SM_REMOTESESSION))
-    except Exception as e:
-        log.debug("GetSystemMetrics failed: %s", e)
+    except Exception as exc:
+        log.debug("GetSystemMetrics failed: %s", exc)
         return False
 
 
-def _proc_has_external_established(proc: "psutil.Process") -> bool:
+def _connected_pids() -> set[int]:
+    """Process ids holding an established TCP connection to another machine."""
     try:
-        for c in proc.net_connections(kind="tcp"):
-            if c.status == psutil.CONN_ESTABLISHED and c.raddr and _is_external(c.raddr.ip):
-                return True
-    except (psutil.AccessDenied, psutil.NoSuchProcess):
-        return False
-    except Exception as e:
-        log.debug("net_connections failed: %s", e)
-    return False
+        return {c.pid for c in psutil.net_connections(kind="tcp")
+                if c.pid and c.status == psutil.CONN_ESTABLISHED and c.raddr
+                and _is_external(c.raddr.ip)}
+    except (psutil.AccessDenied, OSError) as exc:
+        log.debug("connection table unavailable: %s", exc)
+        return set()
 
 
 def active_remote_tools() -> list[str]:
     if psutil is None:
         return []
     found: list[str] = []
-    for p in psutil.process_iter(attrs=["name"]):
-        try:
-            name = (p.info.get("name") or "").lower()
-        except Exception:
-            continue
+    connected: set[int] | None = None
+    for process in psutil.process_iter(attrs=["name", "pid"]):
+        name = (process.info.get("name") or "").lower()
         if name in ALWAYS_REMOTE_PROCS:
             found.append(name)
         elif name in CONNECTION_CHECKED_PROCS:
-            if _proc_has_external_established(p):
+            if connected is None:
+                connected = _connected_pids()
+            if process.info.get("pid") in connected:
                 found.append(f"{name}(connected)")
     return found
 

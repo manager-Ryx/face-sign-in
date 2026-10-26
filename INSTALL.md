@@ -1,249 +1,133 @@
-# Face Unlock — Fresh Install Guide
-
-This captures every lesson learned during the original setup so the next
-install on a fresh machine is painless. Read top-to-bottom.
+# Face Unlock – install and operations guide
 
 ## 0. Prerequisites
 
-| Requirement | Tested version | Install command |
+| Requirement | Tested | Install |
 |---|---|---|
-| Windows 10/11 x64 | 11 Pro 26200 | — |
+| Windows 10/11 x64 | 11 Pro 26200 | – |
 | Python 3.11 or 3.12 | 3.12.10 | `winget install Python.Python.3.12` |
-| Git | any | `winget install Git.Git` |
-| CMake | 4.3 | `winget install Kitware.CMake` |
-| VS Build Tools 2022 (C++ workload + Win11 SDK) | 17.14 | see §5 |
-| GitHub CLI (optional, for push) | 2.89 | `winget install GitHub.cli` |
+| VS Build Tools 2022 (C++ workload) | 17.14 | only for the sign-in tile, see §5 |
+| CMake | 3.31 (bundled with Build Tools) | – |
 
-## 1. Clone + Python setup
+## 1. Python setup
 
 ```powershell
-git clone <this-repo> C:\Users\<you>\Documents\Projects\face-unlock
-cd C:\Users\<you>\Documents\Projects\face-unlock
-.\setup.ps1               # creates .venv, installs deps, registers Task Scheduler tasks
+.\setup.ps1     # creates .venv, installs requirements.txt, registers the sign-in tasks
 ```
 
-`requirements.txt` pulls: `deepface`, `opencv-python`, `pywin32`, `psutil`,
-`pystray`, `Pillow`, `tomli-w`, `tf-keras`, `tomli` (on 3.10 only).
+`requirements.txt` pulls DeepFace, OpenCV, TensorFlow/tf-keras, PyTorch (only
+for optional anti-spoofing), pywin32, psutil, tomli-w, cv2-enumerate-cameras
+and PySide6-Essentials (the app's interface, LGPL-3.0).
 
-## 2. Install PyTorch CPU (required for anti-spoofing)
+Optional, to avoid a slow first run, pre-download the model weights into
+`%USERPROFILE%\.deepface\weights\`: `arcface_weights.h5` (131 MB) and, for
+anti-spoofing, the two MiniFASNet files. See `installer\download_weights.py`.
 
-DeepFace's MiniFASNet liveness model needs torch. The default PyPI build is
-GPU+huge; use the CPU index:
+## 2. First run
 
 ```powershell
-.\.venv\Scripts\pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+.\.venv\Scripts\pythonw -m presence_monitor --show
 ```
 
-~200 MB. Skip if you set `anti_spoofing = false` in config.
+In the app:
 
-## 3. Pre-download weights (avoids flaky GitHub CDN)
+1. **Set up** – a guided capture: good light in front of you, look at the
+   camera, then turn your head slightly as asked. About a minute. Nothing
+   replaces your profile until you select **Save face profile**.
+2. **Store password** – your Windows *account* password (not your PIN). It is
+   checked with Windows, then encrypted with DPAPI for your account only.
+3. **Settings → Camera** – choose your webcam. Only that physical device is
+   ever used; virtual cameras (NVIDIA Broadcast, OBS) can't be chosen.
 
-DeepFace auto-downloads weights at first use but the GitHub release mirror
-sometimes rate-limits or fails. Pre-fetch to `%USERPROFILE%\.deepface\weights\`:
+## 3. Day-to-day behaviour
 
-```powershell
-$w = "$env:USERPROFILE\.deepface\weights"
-New-Item -ItemType Directory -Force -Path $w | Out-Null
-curl -L -o "$w\arcface_weights.h5" https://github.com/serengil/deepface_models/releases/download/v1.0/arcface_weights.h5
-curl -L -o "$w\2.7_80x80_MiniFASNetV2.pth" https://github.com/minivision-ai/Silent-Face-Anti-Spoofing/raw/master/resources/anti_spoof_models/2.7_80x80_MiniFASNetV2.pth
-curl -L -o "$w\4_0_0_80x80_MiniFASNetV1SE.pth" https://github.com/minivision-ai/Silent-Face-Anti-Spoofing/raw/master/resources/anti_spoof_models/4_0_0_80x80_MiniFASNetV1SE.pth
-```
+- **Lock screen.** The tile asks the service to look for you. The first
+  minute after the lock screen appears it scans continuously; if nobody is in
+  view it then takes a quick look every 10 seconds with the camera off in
+  between, and while the display is off it doesn't use the camera at all.
+  Pressing a key or clicking the tile scans immediately.
+- **Frames.** One frame first; up to five when needed. Two matching frames
+  sign you in. "No face" stops after three cheap looks and a clear mismatch
+  after two, so nobody is kept waiting by the camera.
+- **Camera.** Opened only for a check and released straight away (held for a
+  couple of seconds between lock-screen retries). It is used as soon as its
+  image is stable instead of after a fixed number of frames.
+- **Auto-lock.** A check every 5 minutes; Windows locks after about an hour
+  without seeing you. Checks are skipped while Windows is locked, during
+  remote sessions, and when the camera is lent to the setup window; a skipped
+  or failed check never counts as you being away.
 
-Expected sizes: arcface 131MB, MiniFASNetV2 1.8MB, MiniFASNetV1SE 1.8MB.
+## 4. Data folder (`%USERPROFILE%\.face-unlock`)
 
-The YuNet detector (used for DeepFace's detector backend AND the
-`presence_mode=detection` path) is bundled in the repo at
-`models/face_detection_yunet_2023mar.onnx` — no download needed.
+| Path | Contents |
+|---|---|
+| `config.toml`, `config.last-good.toml` | Your settings and the last copy that loaded cleanly |
+| `embeddings.npz` | Face profile (numeric face signatures; original enrollment plus learned samples) |
+| `credentials.bin` | Your Windows password, DPAPI-encrypted |
+| `enroll\` | Your reference photos |
+| `state\` | Automatic tuning (`adaptation.json`), camera measurements, held-out evaluation samples, optional away-time counts |
+| `metrics\` | Local measurements for the Learning page (rotated; never images) |
+| `backups\` | Copies made before replacing photos or the profile |
+| `service.log`, `presence.log` | Logs, rotated at 2 MB (3 kept) |
 
-## 4. Enrollment + password
+## 5. The sign-in tile (Credential Provider)
 
-```powershell
-.\.venv\Scripts\python -m tools.enroll capture --count 15    # look at camera, move head slightly
-.\.venv\Scripts\python -m tools.set_password                 # enter Windows password (DPAPI encrypt)
-```
-
-Enrollment accepts images where a face is detectable; with 15 captures
-expect ~9 usable. Re-run `enroll capture --count 20` if fewer than 6 make it.
-
-`set_password` stores `{user, password, domain}` in
-`%USERPROFILE%\.face-unlock\credentials.bin` encrypted with DPAPI (user
-scope). Password never leaves your user profile.
-
-## 5. Install Visual Studio Build Tools (only for the Credential Provider)
-
-Skip this section if you only want presence auto-lock without real lock-screen
-unlock.
-
-```powershell
-winget install Microsoft.VisualStudio.2022.BuildTools --silent --override `
-  "--wait --quiet --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"
-```
-
-About 6–8 GB. Takes 10–20 minutes depending on bandwidth.
-
-## 6. Build + register the Credential Provider DLL
+The registered DLL is loaded by the sign-in screen as SYSTEM. **Do not run
+`cmake --build build` in place on a machine where the tile is registered from
+`credential_provider\build\Release`** – that silently replaces the live tile.
 
 ```powershell
 cd credential_provider
-cmake -B build -A x64 -G "Visual Studio 17 2022"
-cmake --build build --config Release
-# Then, from an Administrator PowerShell:
-.\register.ps1 -Action register
+cmake -S . -B build-next -A x64 -G "Visual Studio 17 2022"
+cmake --build build-next --config Release
+# Elevated PowerShell, when you're ready (keeps the old DLL for rollback):
+.\update_provider.ps1
+.\update_provider.ps1 -Rollback     # if anything looks wrong
 ```
 
-Uninstall any time: `.\register.ps1 -Action unregister`.
+First-time registration on a new machine: `.\register.ps1 -Action register`
+(elevated). Generate your own GUID in `guid.h` before distributing a build.
 
-### Gotchas encountered while building
-
-These are already fixed in the source; listed only for troubleshooting.
-
-1. **`FIELD_STATE_PAIR` undefined** — it's in the Microsoft sample set, not
-   the public SDK. `helpers.h` defines it locally.
-2. **`CPFG_CREDENTIAL_PROVIDER_LOGO` undefined** — same reason. We use
-   `GUID_NULL` instead; the tile uses the default logo.
-3. **`__ImageBase` undefined in `GetModuleFileNameW`** — because we call it
-   directly from `DllRegisterServer`, not via a helper. Leave the
-   `EXTERN_C IMAGE_DOS_HEADER __ImageBase;` at end of `dll.cpp`.
-4. **`__try/__except` + C++ objects** — MSVC rejects it; use `try/catch`
-   instead (already done).
-5. **"Parameter is incorrect" from LogonUI** — two separate bugs:
-   - `UNICODE_STRING.Buffer` inside the serialization must be an **offset**
-     (in bytes from the start of the buffer), NOT an absolute pointer. LSA
-     does the fixup across process boundaries.
-   - Authentication package: use `"Negotiate"` (NEGOSSP_NAME_A), not
-     `"Kerberos"`. Negotiate auto-picks Kerberos vs NTLM and works for
-     local accounts. Do NOT fall through to `pkgId = 0` on lookup failure —
-     return `HRESULT_FROM_NT(status)`.
-6. **GUID must be unique** — replace `CLSID_FaceCredentialProvider` in
-   `guid.h` with a freshly generated one (`uuidgen`) before distributing.
-
-## 7. Runtime behaviour
-
-### Config knobs (`%USERPROFILE%\.face-unlock\config.toml`)
-
-| Key | Default | Notes |
-|---|---|---|
-| `model_name` | `ArcFace` | DeepFace model |
-| `detector_backend` | `yunet` | Faster + more accurate than opencv Haar |
-| `threshold` | `0.45` | Cosine distance cutoff; lower = stricter |
-| `anti_spoofing` | `true` | Requires torch |
-| `camera_warmup_frames` | `10` | Helps dim lock-screen lighting |
-| `persistent_camera` | `false` | `true` = ~0.9s verify, LED always on. `false` = ~3s verify, LED only while verifying. |
-| `verify_frames` | `5` | Captured per unlock |
-| `verify_required` | `2` | Matches needed |
-| `unlock_verify_frames` | `3` | Maximum frames per fast lock-screen request |
-| `unlock_verify_required` | `2` | Required matches; keeps multi-frame confirmation |
-| `unlock_camera_hold_s` | `15.0` | Reuse the camera across slow active retries, then release it |
-| `adaptive_enrollment` | `false` | Opt-in bounded post-success embedding updates |
-| `adaptive_pre_auth_enabled` | `true` | Keep safe pre-auth candidates in memory until a later Windows success |
-| `adaptive_pre_auth_max_frames` | `24` | Maximum transient candidates retained from failed votes |
-| `adaptive_pre_auth_ttl_s` | `45.0` | Candidate lifetime; expired candidates are discarded |
-| `adaptive_max_embeddings` | `300` | Adaptive-only cap; original manual anchors are additional and never evicted |
-| `adaptive_retention_days` | `14.0` | Rolling age window; final config uses `0` so only cap replacement removes old samples |
-| `presence_interval_s` | `60` | Seconds between presence probes |
-| `presence_absence_timeout_s` | `120` | Minimum uninterrupted absence before `LockWorkStation()`; `0` uses the legacy interval × strikes fallback |
-| `presence_absent_strikes` | `2` | Legacy fallback only when the elapsed timeout is `0` |
-
-### Services
-
-Task Scheduler registers two logon tasks (created by `setup.ps1`):
-
-- **FaceUnlock-Service** — the Python pipe server (`\\.\pipe\FaceUnlock`)
-- **FaceUnlock-Presence** — the tray app + configurable camera probe
-
-Restart both after editing config:
+## 6. Restarting after an update
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\clean_restart.ps1
 ```
 
-### Environment variables that matter
+This stops both tasks and their Python processes and starts them again.
+Face sign-in is unavailable for the ~10 seconds the model takes to load.
 
-Set in `face_service/__main__.py` to stop TensorFlow from spawning extra
-worker processes that compete for the pipe:
+## 7. Restoring the previous version
 
-```
-OMP_NUM_THREADS=1
-TF_NUM_INTRAOP_THREADS=1
-TF_NUM_INTEROP_THREADS=1
-CUDA_VISIBLE_DEVICES=-1
-```
+- Code: `git switch master` (the redesign lives on `redesign-adaptive-ui`), or
+  the full copy in `..\windows-face-unlock-backups\<timestamp>\source`. That
+  folder also holds `pip-freeze.txt` (Python packages), the two scheduled-task
+  definitions, a copy of the installed sign-in tile DLL, and
+  `uncommitted.patch` (work that was uncommitted before the redesign).
+- Settings and profile: `%USERPROFILE%\.face-unlock\backups\before-redesign-<timestamp>\`
+  holds the `config.toml` and `embeddings.npz` from before the redesign;
+  later settings changes leave a `config-before-*.toml` copy beside it.
+- In-app: *Learning → Changes → Restore earlier settings* returns to a saved
+  snapshot; *Undo the last 24 hours* and *Reset learned data* undo learning
+  without touching your original photos; *Forget my routine* clears what the
+  sign-in screen learned about when you come back.
 
-### Remote-session exclusion
+## 8. Troubleshooting
 
-`presence_monitor/remote_session.py` skips auto-lock when:
-
-- RDP session is active (`GetSystemMetrics(SM_REMOTESESSION)`)
-- Known remote-control process holds an ESTABLISHED external TCP connection
-  (UltraViewer, AnyDesk, RustDesk, Parsec, Chrome Remote Desktop, Splashtop)
-- Process name-only match for tools that only run during active sessions
-  (TeamViewer_Desktop.exe, Quick Assist, MSRA)
-
-Tune the list in that file if your remote tool is missing.
-
-### Lock-screen auto-trigger
-
-While LogonUI advises the provider, a cancellable worker polls FaceService
-with bounded backoff. A verified live match is cached for at most 15 seconds
-and announced with `CredentialsChanged`. `GetCredentialCount` requests
-auto-logon only while that one-shot credential is ready. Selecting the tile or
-pressing Enter with no cached credential re-arms one fresh worker, closes the
-stale request/camera lease, and is debounced to one restart per second.
-`GetSerialization` consumes and clears the cached credential; if none is ready,
-it also requests the same re-arm.
-
-During failed votes, only safe near-anchor embeddings are retained in a
-bounded, expiring in-memory buffer. If a later face attempt is accepted by
-Windows, those candidates are included in the normal adaptive transaction.
-No raw frames are persisted, and failed/unreported authentication never trains
-the profile.
-
-Safety: each Advise cycle produces at most one automatic submission, so a bad
-Windows password cannot create a retry loop. Password and PIN providers remain
-visible, and stopping or refreshing LogonUI cancels and joins the worker.
-
-## 8. If you also have `facewinunlock-tauri` installed
-
-Run the disable script once (as Administrator) to turn off its autostart,
-kill its processes, and remove its Credential Provider registrations
-(backed up first):
-
-```powershell
-tools\disable_tauri.ps1
-```
-
-Backup lives at `%USERPROFILE%\face-unlock-backup\` — `reg import` those
-files to restore if needed.
-
-## 9. Troubleshooting
-
-| Symptom | Fix |
+| Symptom | What to do |
 |---|---|
-| `Cannot open camera index 0` | Close other camera apps; Teams/Zoom/UltraViewer can hold the device. Try `camera_index = 1`. |
-| Enrollment says "No face found" on all images | Lighting too dim, or you weren't centred. Re-run `enroll capture --count 20`. |
-| Verify is slow (>5s per call) | Models didn't pre-warm. Check `service.log` for "model warmup ok". Restart service. |
-| Two `python.exe` processes for one service | Normal — venv launcher spawns the real interpreter. Only the inner one runs our code. |
-| `Parameter is incorrect` on lock screen | You're running an old DLL. Re-run `cmake --build build --config Release` and lock/unlock once to reload. |
-| Lock screen hangs for ~12 s | FaceService is down. `Start-ScheduledTask FaceUnlock-Service`. |
-| User stuck, can't reach password | Click "Sign-in options" link on lock screen → pick Password tile. Or boot into Safe Mode; third-party CPs are disabled there. |
+| "Your camera is on a different USB port" | Confirm it on the Overview page. Nothing switches cameras on its own. |
+| "Your face is too dark" | Face a light; low-light mode turns itself on only after measuring that it helps your camera. |
+| Face sign-in is slow after a long time locked | Expected: the camera starts fresh (about 0.6 s, longer in dim light). |
+| Tile shows "Waiting for a verified face" | Use another sign-in option; check the app's Overview for the reason. |
+| Stuck at the lock screen | "Sign-in options" → PIN or Password always works. Safe Mode disables third-party tiles. |
 
-## 10. Logs
-
-- `%USERPROFILE%\.face-unlock\service.log` — FaceService
-- `%USERPROFILE%\.face-unlock\presence.log` — PresenceMonitor
-- Event Viewer → Applications and Services Logs → Microsoft → Windows →
-  User Profile Service / Authentication — for LogonUI / LSA errors when
-  debugging Credential Provider issues
-
-## 11. Uninstall completely
+## 9. Uninstall
 
 ```powershell
-# Admin PowerShell
+# Elevated PowerShell
 .\credential_provider\register.ps1 -Action unregister
 Unregister-ScheduledTask -TaskName 'FaceUnlock-Service' -Confirm:$false
 Unregister-ScheduledTask -TaskName 'FaceUnlock-Presence' -Confirm:$false
 Remove-Item -Recurse -Force "$env:USERPROFILE\.face-unlock"
-Remove-Item -Recurse -Force .\.venv
 ```
-
-The repo can then be deleted.

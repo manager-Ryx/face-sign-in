@@ -11,7 +11,7 @@ Targets:
     models/face_detection_yunet_2023mar.onnx  (already bundled by git)
 """
 from __future__ import annotations
-import hashlib
+
 import sys
 import urllib.request
 from pathlib import Path

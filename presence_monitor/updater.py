@@ -16,19 +16,18 @@ but the network + download run in a background worker so the UI doesn't
 freeze.
 """
 from __future__ import annotations
+
 import hashlib
 import json
 import logging
-import os
 import re
 import subprocess
 import tempfile
-import threading
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from face_service._version import __version__
 from face_service.i18n import t
