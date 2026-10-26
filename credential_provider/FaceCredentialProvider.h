@@ -1,6 +1,9 @@
 #pragma once
 #include <windows.h>
 #include <credentialprovider.h>
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 namespace FaceUnlock {
 
@@ -26,10 +29,25 @@ public:
                                       BOOL* pbAutoLogonWithDefault) override;
     IFACEMETHODIMP GetCredentialAt(DWORD dwIndex, ICredentialProviderCredential** ppcpc) override;
 
+    // Re-arm the one-shot lock-screen worker after the user selects the tile
+    // or presses Enter while no credential is ready.
+    void RearmUnlockWorker();
+
 private:
+    bool StartUnlockWorker(bool force);
+    void UnlockWorker();
+    void NotifyCredentialsChanged();
+
     LONG m_cRef;
     CREDENTIAL_PROVIDER_USAGE_SCENARIO m_cpus;
     FaceCredential* m_pCred;
+    ICredentialProviderEvents* m_pEvents;
+    UINT_PTR m_adviseContext;
+    HANDLE m_stopEvent;
+    std::thread m_worker;
+    std::mutex m_eventsMutex;
+    std::atomic<bool> m_workerActive;
+    std::atomic<ULONGLONG> m_lastRearmTick;
 };
 
 }  // namespace FaceUnlock

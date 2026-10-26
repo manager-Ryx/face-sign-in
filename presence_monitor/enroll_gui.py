@@ -26,7 +26,8 @@ from typing import Callable
 import cv2
 from PIL import Image, ImageTk
 
-from face_service.config import ENROLL_DIR, EMBED_PATH
+from face_service.config import Config, ENROLL_DIR, EMBED_PATH
+from face_service.camera import Camera
 from face_service.detector import FaceDetector
 from face_service.i18n import t
 
@@ -197,30 +198,25 @@ class EnrollWindow:
     # ---------------- camera thread ----------------
 
     def _camera_loop(self) -> None:
-        cap = None
-        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
-            candidate = cv2.VideoCapture(0, backend)
-            if candidate.isOpened():
-                candidate.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                candidate.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                candidate.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap = candidate
-                break
-            candidate.release()
-
-        if cap is None:
+        # Do not contend with the service if the handover was refused.
+        if not self._lease_ok:
+            return
+        cam = Camera.from_config(Config.load())
+        try:
+            cam.open()
+        except Exception as exc:
+            log.exception("Enrollment camera open failed")
+            error = str(exc)
             self.root.after(0, lambda: messagebox.showerror(
-                t("enroll.title"), t("enroll.error.camera"),
-                parent=self.root,
-            ))
+                t("enroll.title"), error, parent=self.root))
             return
 
         try:
             frame_idx = 0
             faces: list[tuple[int, int, int, int]] = []
             while not self._stop.is_set():
-                ok, frame = cap.read()
-                if not ok or frame is None:
+                frame = cam.read()
+                if frame is None:
                     time.sleep(0.05)
                     continue
                 frame_idx += 1
@@ -235,7 +231,7 @@ class EnrollWindow:
                 self._post_preview(annotated)
                 time.sleep(0.03)  # ~30 fps cap
         finally:
-            cap.release()
+            cam.close()
 
     def _detect_faces(self, bgr) -> list[tuple[int, int, int, int]]:
         try:

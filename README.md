@@ -21,8 +21,9 @@ when away, presence monitor, walk-away lock, face id for pc.*
 
 - **Log in with your face** from the Windows lock screen via a proper
   Credential Provider tile (C++ DLL), not a user-mode hack.
-- **Walk-away auto-lock**: every minute the tray process probes the webcam;
-  if your enrolled face isn't there, `LockWorkStation()` fires.
+- **Walk-away auto-lock**: the tray process probes at a configurable interval;
+  after the configured uninterrupted absence duration, `LockWorkStation()`
+  fires. A successful enrolled-face match restarts that timer.
 - **Two presence modes**: strict (must match the enrolled face, blocks
   strangers) or lightweight (any face is enough, replaces old AutoFaceLock
   scripts).
@@ -67,7 +68,7 @@ An open-source, auditable replacement for closed-source webcam-login utilities
 | Component             | Language | Runs as                 | Role                                                                 |
 |-----------------------|----------|-------------------------|----------------------------------------------------------------------|
 | `face_service`        | Python   | User session (always)   | Camera + DeepFace + liveness + DPAPI; exposes a named pipe.          |
-| `presence_monitor`    | Python   | User session (tray)     | Every 60 s, probe presence; if absent → `LockWorkStation()`.         |
+| `presence_monitor`    | Python   | User session (tray)     | Periodically probe presence; lock after the elapsed absence timeout. |
 | `credential_provider` | C++      | LogonUI (SYSTEM)        | Windows Credential Provider tile that calls the service on unlock.   |
 
 Plus two CLI tools: `tools.enroll` (capture reference photos) and
@@ -88,7 +89,7 @@ Howdy uses on Linux with PAM.
   (MiniFASNet) — blocks flat photos of your face
 - **DPAPI-protected** Windows password storage (user scope)
 - **Multi-frame voting** for unlock: N out of M frames must match
-- **Presence auto-lock** every minute, with *remote-context exclusion*:
+- **Presence auto-lock** at a configurable interval, with *remote-context exclusion*:
   skips when the session is RDP or when TeamViewer / AnyDesk / RustDesk /
   Parsec / Chrome Remote Desktop / Quick Assist / UltraViewer are actively
   connected. Also skips when input was received recently or when paused
@@ -167,9 +168,39 @@ See [config.example.toml](config.example.toml). Key knobs:
 
 - `threshold` — cosine distance cutoff. Lower = stricter. Tune after enrolling.
 - `verify_frames` / `verify_required` — multi-frame voting.
+- `unlock_verify_frames` / `unlock_verify_required` — the faster lock-screen
+  vote (default two matches from at most three frames). Requests are serialized,
+  with a 100 ms to 1 second bounded retry delay, so there is no fixed FPS.
+- `unlock_camera_hold_s` — when the normal camera is non-persistent, retain its
+  warm handle across the slow lock-screen retries; the supplied configuration
+  uses 15 seconds and releases it shortly after the retry stream stops.
+- `adaptive_enrollment` — opt into bounded post-unlock embedding updates. It
+  stores no new photos, preserves every original manual enrollment anchor, and
+  keeps up to 300 adaptive samples in addition to the anchors. The final
+  configuration sets `adaptive_retention_days = 0`, so age never removes a
+  sample; when the cap is reached, newer accepted samples replace the oldest
+  adaptive samples. Both values are configurable with
+  `adaptive_max_embeddings` and `adaptive_retention_days`. An ArcFace
+  profile at the default cap is roughly 0.6 MiB; comparisons are vectorized,
+  so camera capture and face inference remain the meaningful costs.
+- `adaptive_pre_auth_enabled` — retain safe embedding candidates from recent
+  failed lock-screen votes in memory only. They are capped by
+  `adaptive_pre_auth_max_frames` (final: 24) and
+  `adaptive_pre_auth_ttl_s` (final: 45 seconds), then discarded. If a later
+  face attempt is accepted by Windows, the candidates may be committed through
+  the same immutable-anchor quality gates; failed/unreported attempts never
+  train the profile.
 - `presence_interval_s` — how often to probe (default 60).
-- `presence_absent_strikes` — lock after N consecutive absent ticks (default 2,
-  so effective lock timeout is `interval * strikes` = 2 minutes).
+- `presence_absence_timeout_s` — minimum uninterrupted time without a
+  successful enrolled-face match before locking. Successful matches restart
+  the monotonic timer; failed/skipped probes reset it rather than locking
+  blindly. Set to `0` only for legacy `interval * strikes` behaviour.
+- `persistent_camera = false` — release the webcam after every request. The
+  recognition model remains idle between probes and is not run continuously.
+- Selecting the Face Unlock tile or pressing Enter while it has no ready
+  credential re-arms one fresh worker, closes a stale request/camera lease, and
+  retries with a one-second debounce. This is the low-resource wake path; no
+  separate motion detector is needed.
 
 ## Security notes
 
@@ -179,12 +210,21 @@ Read these before trusting the CP for daily unlock:
    protects it from other users and from offline disk inspection, but **not**
    from malware running as you. If your attacker model includes that, use a
    smart card or Windows Hello proper.
-2. The pipe currently uses a NULL DACL (any local user can connect). This is
-   acceptable for a personal machine but consider tightening to `SELF` +
-   `SYSTEM` in `_build_sa_everyone()` if multiple accounts share the PC.
+2. The pipe DACL allows only the enrolled Windows user and LocalSystem.
+   Plaintext credentials still cross that local pipe briefly after a verified
+   match, so protect the user session from same-user malware.
 3. Anti-spoofing blocks 2-D photos but **not 3-D masks or deepfake screens**.
 4. The credential provider skeleton uses a hard-coded GUID from this repo —
    **generate your own** before sharing builds.
+5. Adaptive enrollment is deliberately conservative: it requires exactly one
+   sharp, sufficiently large, high-confidence face; a match materially inside
+   the threshold against an immutable manual anchor; and a non-duplicate
+   embedding. Samples are staged before credential serialization and committed
+   atomically only if Credential Provider `ReportResult` reports success.
+   Failed attempts, password/PIN unlocks, and unacknowledged face attempts add
+   nothing. Some successful Windows flows may omit that callback, in which case
+   the staged sample expires rather than risking profile poisoning. Adaptive
+   samples roll out after 14 days by default; original manual anchors never do.
 
 ## Credits / prior art
 

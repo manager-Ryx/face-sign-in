@@ -131,15 +131,25 @@ These are already fixed in the source; listed only for troubleshooting.
 | `persistent_camera` | `false` | `true` = ~0.9s verify, LED always on. `false` = ~3s verify, LED only while verifying. |
 | `verify_frames` | `5` | Captured per unlock |
 | `verify_required` | `2` | Matches needed |
-| `presence_interval_s` | `60` | Presence auto-lock tick |
-| `presence_absent_strikes` | `2` | Lock after N absent ticks |
+| `unlock_verify_frames` | `3` | Maximum frames per fast lock-screen request |
+| `unlock_verify_required` | `2` | Required matches; keeps multi-frame confirmation |
+| `unlock_camera_hold_s` | `15.0` | Reuse the camera across slow active retries, then release it |
+| `adaptive_enrollment` | `false` | Opt-in bounded post-success embedding updates |
+| `adaptive_pre_auth_enabled` | `true` | Keep safe pre-auth candidates in memory until a later Windows success |
+| `adaptive_pre_auth_max_frames` | `24` | Maximum transient candidates retained from failed votes |
+| `adaptive_pre_auth_ttl_s` | `45.0` | Candidate lifetime; expired candidates are discarded |
+| `adaptive_max_embeddings` | `300` | Adaptive-only cap; original manual anchors are additional and never evicted |
+| `adaptive_retention_days` | `14.0` | Rolling age window; final config uses `0` so only cap replacement removes old samples |
+| `presence_interval_s` | `60` | Seconds between presence probes |
+| `presence_absence_timeout_s` | `120` | Minimum uninterrupted absence before `LockWorkStation()`; `0` uses the legacy interval × strikes fallback |
+| `presence_absent_strikes` | `2` | Legacy fallback only when the elapsed timeout is `0` |
 
 ### Services
 
 Task Scheduler registers two logon tasks (created by `setup.ps1`):
 
 - **FaceUnlock-Service** — the Python pipe server (`\\.\pipe\FaceUnlock`)
-- **FaceUnlock-Presence** — the tray app + 60s camera probe
+- **FaceUnlock-Presence** — the tray app + configurable camera probe
 
 Restart both after editing config:
 
@@ -173,15 +183,24 @@ Tune the list in that file if your remote tool is missing.
 
 ### Lock-screen auto-trigger
 
-`FaceCredentialProvider::GetCredentialCount` returns
-`pbAutoLogonWithDefault = TRUE` and `FaceCredential::SetSelected` returns
-`pbAutoLogon = TRUE`. Result: as soon as the lock screen appears (key
-press / mouse motion), the face tile is selected and verification runs
-automatically.
+While LogonUI advises the provider, a cancellable worker polls FaceService
+with bounded backoff. A verified live match is cached for at most 15 seconds
+and announced with `CredentialsChanged`. `GetCredentialCount` requests
+auto-logon only while that one-shot credential is ready. Selecting the tile or
+pressing Enter with no cached credential re-arms one fresh worker, closes the
+stale request/camera lease, and is debounced to one restart per second.
+`GetSerialization` consumes and clears the cached credential; if none is ready,
+it also requests the same re-arm.
 
-Safety: `GetSerialization` has a hard 12-second timeout and returns
-`S_FALSE` on failure, so a bad verify cannot lock the user out of the
-password tile.
+During failed votes, only safe near-anchor embeddings are retained in a
+bounded, expiring in-memory buffer. If a later face attempt is accepted by
+Windows, those candidates are included in the normal adaptive transaction.
+No raw frames are persisted, and failed/unreported authentication never trains
+the profile.
+
+Safety: each Advise cycle produces at most one automatic submission, so a bad
+Windows password cannot create a retry loop. Password and PIN providers remain
+visible, and stopping or refreshing LogonUI cancels and joins the worker.
 
 ## 8. If you also have `facewinunlock-tauri` installed
 

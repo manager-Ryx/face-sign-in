@@ -9,9 +9,28 @@ anti_spoofing = true
 camera_index = 0
 verify_frames = 5               # frames captured per verify
 verify_required = 3             # matches needed out of verify_frames
+unlock_verify_frames = 3        # fast lock-screen vote; inference-limited, not fixed FPS
+unlock_verify_required = 2      # preserve multi-frame identity confirmation
+unlock_camera_hold_s = 15.0     # keep camera warm across slow active lock-screen retries
+
+# Adaptive enrollment is opt-in. It stores embeddings, not photos, and updates
+# only after Windows reports that a face-submitted credential was accepted.
+adaptive_enrollment = false
+adaptive_samples_per_unlock = 2
+adaptive_pre_auth_enabled = true  # transient safe embeddings from recent failed votes
+adaptive_pre_auth_max_frames = 24 # memory-only candidate cap
+adaptive_pre_auth_ttl_s = 45.0     # discard candidates after this many seconds
+adaptive_max_embeddings = 300   # adaptive-only cap; manual anchors are stored in addition
+adaptive_retention_days = 14.0  # rolling age window; 0 disables age expiry
+adaptive_match_margin = 0.10    # require distance <= threshold - margin against a manual anchor
+adaptive_min_diversity = 0.025  # reject near-duplicate embeddings
+adaptive_min_face_confidence = 0.90
+adaptive_min_face_area_ratio = 0.04
+adaptive_min_blur = 40.0
 
 presence_interval_s = 60        # 1 minute
-presence_absent_strikes = 2     # lock after N consecutive absent ticks
+presence_absence_timeout_s = 120 # lock after 2 uninterrupted minutes without a match
+presence_absent_strikes = 2     # legacy fallback; used only when timeout is 0
 presence_mode = "recognition"   # "recognition" (DeepFace must match enrolled)
                                 # or "detection" (YuNet any-face-in-frame)
 

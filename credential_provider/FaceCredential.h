@@ -1,16 +1,25 @@
 #pragma once
 #include <windows.h>
 #include <credentialprovider.h>
+#include <mutex>
 #include <string>
 
 namespace FaceUnlock {
 
+class FaceCredentialProvider;
+
 class FaceCredential : public ICredentialProviderCredential {
 public:
-    FaceCredential();
+    explicit FaceCredential(FaceCredentialProvider* owner);
     ~FaceCredential();
 
     HRESULT Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus);
+    bool CachePendingCredential(const std::wstring& username,
+                                const std::wstring& password,
+                                const std::wstring& domain,
+                                const std::string& attemptId);
+    bool HasPendingCredential() const;
+    void ClearPendingCredential();
 
     // IUnknown
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
@@ -44,11 +53,24 @@ public:
                                 CREDENTIAL_PROVIDER_STATUS_ICON* pcpsiOptionalStatusIcon) override;
 
 private:
+    bool ConsumePendingCredential(std::wstring& username,
+                                  std::wstring& password,
+                                  std::wstring& domain,
+                                  std::string& attemptId);
+
     LONG m_cRef;
     CREDENTIAL_PROVIDER_USAGE_SCENARIO m_cpus;
     ICredentialProviderCredentialEvents* m_pEvents;
+    mutable std::mutex m_mutex;
     std::wstring m_label;
     std::wstring m_status;
+    std::wstring m_cachedUsername;
+    std::wstring m_cachedPassword;
+    std::wstring m_cachedDomain;
+    std::string m_cachedAttemptId;
+    std::string m_inflightAttemptId;
+    bool m_ready;
+    FaceCredentialProvider* m_owner;
 };
 
 }  // namespace FaceUnlock

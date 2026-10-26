@@ -60,7 +60,7 @@ _EN: dict[str, str] = {
     "tray.help": "Help…",
     "tray.quit": "Quit (stop service + tray)",
     # ---- tray menu tooltips (for the Help dialog since pystray can't hover) ----
-    "tray.status.desc": "Open the live status dashboard: service uptime, last probe, strikes, lock count.",
+    "tray.status.desc": "Open the live status dashboard: service uptime, last probe, absence timer, lock count.",
     "tray.settings.desc": "Open the settings editor to change probe interval, mode, thresholds, and language.",
     "tray.probe.desc": "Run a single camera probe right now without waiting for the next tick.",
     "tray.pause.desc": "Temporarily stop presence checks. Nothing will lock the machine until you Resume.",
@@ -80,7 +80,7 @@ _EN: dict[str, str] = {
     "status.last": "Last probe",
     "status.result": "Last result",
     "status.reason": "Reason",
-    "status.strikes": "Strikes",
+    "status.absence": "Absence timer",
     "status.lock_count": "Lock count",
     "status.paused": "Paused",
     "status.enrollment": "Enrollment",
@@ -101,8 +101,8 @@ _EN: dict[str, str] = {
     "status.mode.desc": "Which logic the last probe used: 'recognition' (must match enrolled face) or 'detection' (any face is enough).",
     "status.last.desc": "How long ago the monitor last probed the camera.",
     "status.result.desc": "Outcome of the last probe: present / absent / skipped / error.",
-    "status.reason.desc": "Human-readable reason attached to the last probe outcome (e.g. 'paused', 'rdp', 'strike 1/2').",
-    "status.strikes.desc": "Consecutive absent probes. When this reaches the limit on the right, the workstation is locked and the counter resets.",
+    "status.reason.desc": "Human-readable reason attached to the last probe outcome (e.g. 'paused', 'rdp', or elapsed absence).",
+    "status.absence.desc": "Elapsed uninterrupted time without a successful enrolled-face match. The workstation locks only when this reaches the configured duration.",
     "status.lock_count.desc": "How many times this monitor has locked the workstation since the process started.",
     "status.paused.desc": "If yes, presence checks are paused from the tray and nothing will be locked until you Resume.",
     "status.enrollment.desc": "Whether reference face embeddings are present on disk. If 'no', recognition mode cannot work — run Enroll first.",
@@ -130,6 +130,9 @@ _EN: dict[str, str] = {
 
     "field.presence_interval_s": "Probe interval (seconds)",
     "field.presence_interval_s.desc": "How often the monitor probes the camera. 60 = once a minute. Lower = faster reaction and more LED blinks; higher = less camera wear.",
+
+    "field.presence_absence_timeout_s": "Continuous absence before lock (seconds)",
+    "field.presence_absence_timeout_s.desc": "Lock only after this much uninterrupted time without an enrolled-face match. A successful match restarts the timer; skipped or failed probes cancel it for safety.",
 
     "field.presence_absent_strikes": "Absent strikes before lock",
     "field.presence_absent_strikes.desc": "How many consecutive absent probes are needed to trigger LockWorkStation. With interval=60s and strikes=2, the machine locks after ~2 minutes of no face.",

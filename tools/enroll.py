@@ -23,7 +23,7 @@ def cmd_capture(count: int) -> None:
     ENROLL_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Capturing {count} images into {ENROLL_DIR}")
     print("Move your head slightly between frames (different angles help).")
-    with Camera(0) as cam:
+    with Camera.from_config(Config.load()) as cam:
         for i in range(count):
             for _ in range(5):
                 cam.read()

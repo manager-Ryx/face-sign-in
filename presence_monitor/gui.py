@@ -45,7 +45,7 @@ STATUS_ROWS = [
     ("status.last",       "last"),
     ("status.result",     "result"),
     ("status.reason",     "reason"),
-    ("status.strikes",    "strikes"),
+    ("status.absence",    "absence"),
     ("status.lock_count", "locks"),
     ("status.paused",     "paused"),
     ("status.enrollment", "enroll"),
@@ -129,8 +129,9 @@ class StatusWindow:
         self.vars["last"].set(_format_age(snap.get("last_at", 0)))
         self.vars["result"].set(snap.get("last_result", "—"))
         self.vars["reason"].set(snap.get("last_reason", "") or "—")
-        self.vars["strikes"].set(
-            f"{snap.get('strikes', 0)} / {snap.get('absent_strikes', 0)}"
+        self.vars["absence"].set(
+            f"{snap.get('absence_elapsed_s', 0):.0f}s / "
+            f"{snap.get('absence_timeout_s', 0)}s"
         )
         self.vars["locks"].set(str(snap.get("lock_count", 0)))
         self.vars["paused"].set(
@@ -171,7 +172,7 @@ SETTINGS_FIELDS: list[tuple[str, str, object]] = [
     ("language",                  "combo_lang", None),
     ("presence_mode",             "combo",      PRESENCE_MODES),
     ("presence_interval_s",       "int",        (5, 3600)),
-    ("presence_absent_strikes",   "int",        (1, 20)),
+    ("presence_absence_timeout_s", "int",       (5, 86400)),
     ("threshold",                 "float",      (0.05, 1.5)),
     ("verify_frames",             "int",        (1, 30)),
     ("verify_required",           "int",        (1, 30)),
