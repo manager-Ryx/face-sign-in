@@ -55,6 +55,12 @@ class G:
     DIAGNOSTIC = ""
     NEW_WINDOW = ""
     CHEVRON_RIGHT = ""
+    SEARCH = ""
+    COPY = ""
+    HELP = ""
+    VOLUME = ""
+    MUTE = ""
+    DOWNLOAD = ""
 
 
 def glyph_pixmap(glyph: str, color: str | QColor, size: int, dpr: float = 1.0) -> QPixmap:

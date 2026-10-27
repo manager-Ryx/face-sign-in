@@ -17,6 +17,8 @@ if not _home or not os.path.abspath(_home).startswith(os.path.abspath(tempfile.g
 # ...with DeepFace's model folder inside it (a test never reads or downloads real models)...
 os.environ["DEEPFACE_HOME"] = _home
 # ...and at a pipe nobody serves, so no test reaches the running service.
+# ...and still: no animations or sounds.
+os.environ["FACE_UNLOCK_STILL"] = "1"
 os.environ["FACE_UNLOCK_PIPE"] = rf"\\.\pipe\FaceUnlockTests-{os.getpid()}"
 
 HOME = _home

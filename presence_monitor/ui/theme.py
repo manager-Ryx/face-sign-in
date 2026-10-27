@@ -204,6 +204,20 @@ QPushButton#Subtle:pressed {{ background: {t.subtle_pressed}; }}
 QPushButton#Subtle:focus {{ border: 2px solid {t.focus}; padding: 2px 8px; }}
 QPushButton#Subtle:disabled {{ color: {t.text3}; }}
 
+QPushButton#Glyph {{
+    background: transparent; border: none; border-radius: 4px; padding: 0;
+    color: {t.text2}; font-family: "{font_family(ICON_FONT)}"; font-size: 13px;
+}}
+QPushButton#Glyph:hover {{ background: {t.subtle_hover}; color: {t.text}; }}
+QPushButton#Glyph:pressed {{ background: {t.subtle_pressed}; }}
+QPushButton#Glyph:focus {{ border: 2px solid {t.focus}; }}
+QPushButton#Glyph:checked {{ color: {t.accent_text}; }}
+
+QFrame#Toast {{
+    background: {t.card}; border: 1px solid {t.divider}; border-bottom: 2px solid {t.divider};
+    border-radius: 8px;
+}}
+
 QToolTip {{
     background: {t.card}; color: {t.text}; border: 1px solid {t.card_border};
     border-radius: 4px; padding: 6px 8px; font-family: "{text}"; font-size: 12px;
