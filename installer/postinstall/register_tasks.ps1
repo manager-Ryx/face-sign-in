@@ -14,8 +14,10 @@ function Register-HiddenTask {
     $action  = New-ScheduledTaskAction  -Execute $Execute -WorkingDirectory $WorkingDirectory
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $prins   = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+    # No time limit: Task Scheduler's default would stop both after 72 hours.
     $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                                            -StartWhenAvailable -Hidden
+                                            -StartWhenAvailable -Hidden `
+                                            -ExecutionTimeLimit ([TimeSpan]::Zero)
     Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $prins `
                            -Settings $set -Force | Out-Null
     Write-Host "Registered: $Name -> $Execute"

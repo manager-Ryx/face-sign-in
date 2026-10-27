@@ -38,7 +38,8 @@ function Register-LogonTask {
     $action  = New-ScheduledTaskAction -Execute $pyw -Argument "-m $Script" -WorkingDirectory $root
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $prins   = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-    $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
+    # No time limit: Task Scheduler's default would stop both after 72 hours.
+    $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero)
     Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $prins -Settings $set -Force | Out-Null
     Write-Host "Registered task (hidden, pythonw): $Name"
 }
