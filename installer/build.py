@@ -97,7 +97,7 @@ def step_stage(dist_root: Path, cp_dll: Path | None) -> None:
         reg = CP_DIR / "register.ps1"
         if reg.exists():
             shutil.copy2(reg, dest / "register.ps1")
-    for doc in ("README.md", "LICENSE", "INSTALL.md"):
+    for doc in ("README.md", "LICENSE", "INSTALL.md", "THIRD_PARTY_NOTICES.md"):
         p = REPO_ROOT / doc
         if p.exists():
             shutil.copy2(p, dist_root / doc)

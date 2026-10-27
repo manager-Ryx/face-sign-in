@@ -141,7 +141,7 @@ class DemoController(QObject):
                            anti_spoofing=False, theme=theme_name, absence_learning=True,
                            unlock_idle_after_s=1800.0, unlock_idle_interval_s=3.0,
                            unlock_pause_when_display_off=False,
-                           camera_device_id=r"\\?\usb#vid_0625&pid_a3a6&mi_02#6&2ea1f093&0&0002")
+                           camera_device_id=r"\\?\usb#vid_0625&pid_a3a6&mi_02#6&3c4d5e6f&0&0002")
         self.config_problems: list[str] = []
         self.tokens = theme.apply_theme(app, theme_name)
         self.metrics = NullMetrics()

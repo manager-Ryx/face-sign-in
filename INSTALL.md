@@ -36,14 +36,15 @@ installer opens it at the end; `--welcome` opens it on demand):
 2. **Get ready** – done for you where possible: starts the background
    service, picks your webcam when there is only one real camera (virtual
    cameras such as NVIDIA Broadcast or OBS are never chosen), waits for the
-   face model (shipped with the installer; otherwise downloaded once, about
-   130 MB), adds face sign-in to the lock screen (Windows asks for permission
+   face model (downloaded once on first start, about 130 MB, unless the
+   installer was built with it), adds face sign-in to the lock screen (Windows asks for permission
    once), and makes Face Unlock start when you sign in. It also warns when
    Windows is set to "only allow Windows Hello sign-in", which hides the tile.
 3. **Password** – your Windows *account* password (not your PIN). It is
    checked with Windows, then encrypted with DPAPI for your account only. If
-   Windows later rejects it twice (you changed it), face sign-in stops using
-   it and asks for the new one.
+   Windows later turns it down as wrong twice (you changed it), face sign-in
+   stops using it and asks for the new one. Other failures, such as a work
+   laptop that can't reach its domain, don't count.
 4. **Your face** – a guided capture of about a minute, with *Take photo now*
    and *Skip this angle* when an angle won't register.
 5. **Preferences** – auto-lock and its timeout, how eagerly the sign-in
@@ -110,16 +111,12 @@ powershell -ExecutionPolicy Bypass -File tools\clean_restart.ps1
 This stops both tasks and their Python processes and starts them again.
 Face sign-in is unavailable for the ~10 seconds the model takes to load.
 
-## 7. Restoring the previous version
+## 7. Restoring an earlier state
 
-- Code: `git switch master` (the redesign lives on `redesign-adaptive-ui`), or
-  the full copy in `..\windows-face-unlock-backups\<timestamp>\source`. That
-  folder also holds `pip-freeze.txt` (Python packages), the two scheduled-task
-  definitions, a copy of the installed sign-in tile DLL, and
-  `uncommitted.patch` (work that was uncommitted before the redesign).
-- Settings and profile: `%USERPROFILE%\.face-unlock\backups\before-redesign-<timestamp>\`
-  holds the `config.toml` and `embeddings.npz` from before the redesign;
-  later settings changes leave a `config-before-*.toml` copy beside it.
+- Code: install an earlier release from the Releases page, or for a source
+  install check out its tag (`git checkout v<version>`).
+- Settings and profile: `%USERPROFILE%\.face-unlock\backups\` holds copies
+  made before reference photos, the profile or settings were replaced.
 - In-app: *Learning → Changes → Restore earlier settings* returns to a saved
   snapshot; *Undo the last 24 hours* and *Reset learned data* undo learning
   without touching your original photos; *Forget my routine* clears what the

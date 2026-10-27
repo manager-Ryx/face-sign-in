@@ -54,11 +54,27 @@ From a full read plus an independent review. "Fixed" items have tests.
 | The taskbar showed Python's icon | **Fixed** (the app sets its own Windows app ID) |
 | Presence checks were skipped for 35 s after a sign-in, and the absence timer only started at the next 5-minute check | **Fixed** (the sign-in screen releases the camera as soon as you are signed in) |
 | The caller check and request log wrote one entry per lock-screen request (9,186 records and ~900 log lines an hour overnight) | **Fixed** (one caller record per lock, plus any other caller; per-request lines at debug level) |
+| An independent bug audit before publishing (15 findings, all addressed below) | |
+| The tile's own retry could look like a tile click and undo the "wait after Windows+L" rule | **Fixed**: tiles from 0.3 say when you selected them; a selection within 10 s of the lock never counts (tested). Older tiles keep the overlap rule, with the same 10 s guard |
+| A recognised face stayed usable without limit if LogonUI was interrupted (Esc, another sign-in option) | **Fixed in the tile**: it expires 15 s after the match whatever happens to the worker |
+| The tile opened the pipe at impersonation level, as SYSTEM | **Fixed in the tile**: identification level (the service can still check the caller; verified against the live service) |
+| The tile trusted any process that created `\\.\pipe\FaceUnlock` | **Fixed in the tile**: only a pipe whose server runs as the signed-in user is used (verified with a test harness) |
+| Any failed sign-in (an offline domain laptop) counted as a wrong stored password and paused face sign-in | **Fixed**: the tile passes Windows' result codes; only a wrong password, unknown user or expired password counts (tested) |
+| A damaged `evaluation.npz` or face profile (power loss) stopped the service from starting | **Fixed**: damaged learned data starts afresh; a damaged profile is copied aside and reported as "not set up"; writes are fsynced (tested) |
+| Stopping the setup camera twice could delete a running capture thread and close the app | **Fixed**: stopped workers are kept until their thread ends; double clicks are ignored |
+| Setup could replace (not add to) the face profile before the service's first status reply | **Fixed**: only a service that reports no profile turns "add" into "replace" (tested) |
+| Pasting a password of 32,768+ characters could reach LSA as an empty password | **Fixed in the tile**: lengths are checked before packing |
+| The tile's provider pointer could dangle; a worker in a LogonUI callback could hang the sign-in screen on UnAdvise | **Fixed in the tile**: owner cleared on destruction; workers have generations and are waited for at most 3 s, then left to finish on their own |
+| An error while closing the camera kept it locked (no sign-in, no auto-lock) until a restart | **Fixed** (tested) |
+| First-run setup's face capture kept the camera across Windows+L | **Fixed**: it registers like the other capture window |
+| A missing photo-protection model showed as "no face", so every sign-in failed silently and presence checks read as absence | **Fixed**: loaded at start-up; failures show on the Overview and are never counted as absence (tested) |
+| A refused `LockWorkStation` was never retried | **Fixed**: retried at the next check; the service's "automatic lock" notice is withdrawn (tested) |
+| Update notices built Qt images off the GUI thread; the password dialog froze while Windows checked the password; unbounded pipe threads; "0 seconds" shown for the default auto-lock time | **Fixed** (the default is now one hour, as documented) |
 | Learning from frames of failed attempts | **Removed** (brief: failed attempts never train) |
 | Credential Provider: DLL could be unloaded while its worker ran; self-UnAdvise left the tile dead; registration errors ignored; CLSID duplicated as strings | **Fixed in source, compiled to `build-next`, not installed** (`credential_provider\update_provider.ps1`, with rollback) |
-| Pipe instance squatting by same-user processes | **Open** – needs a SYSTEM-owned service or client-side server verification in the tile |
+| Pipe instance squatting | **Mitigated in tile 0.3**: a pipe from another account is refused. A squatter can still deny the service its pipe name, and malware running as you is out of scope – needs a SYSTEM-owned service |
 | Plain-text password briefly in Python memory | **Accepted limit** of a user-mode service; a commercial design should move the secret out of user mode |
-| Updater pointed at the upstream repo and ran installers without a mandatory checksum | **Mitigated**: automatic checks off by default with a warning; still needs fail-closed checksums and Authenticode checks before any release channel |
+| Updater pointed at the upstream repo and ran installers without a mandatory checksum | **Mitigated**: it now points at this project's releases; automatic checks are off by default with a warning; still needs fail-closed checksums and Authenticode checks before any release channel |
 | Installer created a world-writable data folder and registered tasks for the elevated account | **Fixed in `installer.iss`** (not rebuilt here) |
 | Interface translations | **Deferred**: new screens are English; the i18n mechanism remains |
 

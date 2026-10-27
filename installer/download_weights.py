@@ -1,8 +1,9 @@
-"""Pre-download the DeepFace + MiniFASNet weights into the build tree.
+"""Pre-download model weights into the build tree, to be bundled.
 
-The resulting tree is bundled into the installer so end-user machines
-don't need to reach GitHub on first unlock (and so the install works
-offline after download).
+MiniFASNet (photo protection, Apache-2.0) is always bundled, so it works
+offline. ArcFace is bundled only with BUNDLE_ARCFACE=1: its weights are
+generally licensed for non-commercial research, so public releases leave
+them out and the app downloads them once, on first start (about 130 MB).
 
 Targets:
     models/weights/arcface_weights.h5
@@ -12,6 +13,7 @@ Targets:
 """
 from __future__ import annotations
 
+import os
 import sys
 import urllib.request
 from pathlib import Path
@@ -61,7 +63,12 @@ def _fetch(url: str, dest: Path) -> None:
 def main() -> int:
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     rc = 0
+    bundle_arcface = os.environ.get("BUNDLE_ARCFACE") == "1"
     for url, dest, min_bytes in FILES:
+        if dest.name == "arcface_weights.h5" and not bundle_arcface:
+            print(f"[skip] {dest.name}: downloaded by the app on first start "
+                  "(set BUNDLE_ARCFACE=1 to ship it)")
+            continue
         if dest.exists() and dest.stat().st_size >= min_bytes:
             print(f"[skip] {dest.name} already present ({dest.stat().st_size} B)")
             continue

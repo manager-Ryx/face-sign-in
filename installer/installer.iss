@@ -6,15 +6,20 @@
 
 #define MyAppName "Windows Face Unlock"
 #define MyAppShortName "WindowsFaceUnlock"
-#define MyAppVersion "0.2.0"
-#define MyAppPublisher "Cao Chi Tam"
-#define MyAppURL "https://github.com/caochitam/windows-face-unlock"
+#define MyAppVersion "0.3.0"
+#define MyAppPublisher "Ryan van Zyl"
+#define MyAppURL "https://github.com/manager-Ryx/face-sign-in"
 #define MyAppExeName "face_unlock_tray.exe"
 #define MyServiceExe "face_service.exe"
 #define BuildRoot "..\dist\WindowsFaceUnlock"
+; Decided when the installer is built: Setup's own file checks run before any
+; file is installed, so they can't see the tile it is about to install.
+#define HaveTile FileExists(AddBackslash(SourcePath) + BuildRoot + "\credential_provider\FaceCredentialProvider.dll")
 
 [Setup]
-AppId={{2F7A9B14-3C31-4B1E-9AB9-5E0D1B02B6A7}
+; This fork's own ID (the original project used {2F7A9B14-...}), so the two
+; never upgrade or uninstall each other.
+AppId={{6795F92E-E1C6-4D2A-9A26-CA169621F440}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
@@ -46,8 +51,9 @@ UsePreviousTasks=yes
 Name: "english";  MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "cp"; Description: "Add face sign-in to the Windows lock screen (recommended)"; \
-  Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); GroupDescription: "Windows integration"
+#if HaveTile
+Name: "cp"; Description: "Add face sign-in to the Windows lock screen (recommended)"; GroupDescription: "Windows integration"
+#endif
 Name: "startuptray"; Description: "Start the Face Unlock tray at sign-in"; GroupDescription: "Windows integration"
 
 [Files]
@@ -74,8 +80,10 @@ Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: 
 
 [Run]
 ; 1. Register the Credential Provider DLL (only if the user ticked the task)
+#if HaveTile
 Filename: "regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
   Tasks: cp; StatusMsg: "Registering Credential Provider…"; Flags: runhidden
+#endif
 
 ; 2. Create the per-user sign-in tasks as the user who started Setup (not the
 ;    elevated account), so they run in that user's session and profile.

@@ -16,7 +16,7 @@ from face_service.camera import (
     resolve,
 )
 
-PINNED = r"\\?\usb#vid_0625&pid_a3a6&mi_02#6&2ea1f093&0&0002"
+PINNED = r"\\?\usb#vid_0625&pid_a3a6&mi_02#6&3c4d5e6f&0&0002"
 SAME_MODEL_OTHER_PORT = r"\\?\usb#vid_0625&pid_a3a6&mi_02#7&11111111&0&0001"
 BROADCAST = r"\\?\root#nvidia_broadcast#0000"
 

@@ -62,7 +62,7 @@ jobs:
           (Get-Content face_service\_version.py) -replace '(__version__\s*=\s*")[^"]+(")', "`$1$ver`$2" | Set-Content face_service\_version.py
           (Get-Content installer\installer.iss) -replace '(#define MyAppVersion ")[^"]+(")', "`$1$ver`$2" | Set-Content installer\installer.iss
 
-      - name: Pre-download model weights
+      - name: Pre-download model weights (photo protection; ArcFace downloads on first start)
         shell: powershell
         run: python installer\download_weights.py
 
@@ -77,6 +77,14 @@ jobs:
       - name: Build installer (PyInstaller + Inno Setup)
         shell: powershell
         run: python installer\build.py
+
+      - name: Check the sign-in tile is in the installer
+        shell: powershell
+        run: |
+          # Without it face sign-in can't appear on the lock screen: never publish that.
+          if (-not (Test-Path dist\WindowsFaceUnlock\credential_provider\FaceCredentialProvider.dll)) {
+            throw "FaceCredentialProvider.dll was not built"
+          }
 
       - name: Detect SignPath config
         id: signcheck
@@ -136,5 +144,5 @@ jobs:
             installer_output/WindowsFaceUnlock-Setup-*.exe
             installer_output/WindowsFaceUnlock-Setup-*.exe.sha256
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true

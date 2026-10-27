@@ -10,6 +10,25 @@ when you walk away. Everything runs locally; nothing is uploaded.
 | Licence  | MIT (see the model-licence note under *Commercial use*) |
 | Models   | ArcFace via DeepFace, YuNet face detector, optional MiniFASNet liveness |
 
+## Install
+
+1. Download `WindowsFaceUnlock-Setup-<version>.exe` from
+   [Releases](https://github.com/manager-Ryx/face-sign-in/releases).
+2. Run it. The installer isn't code-signed yet, so SmartScreen may say
+   "Windows protected your PC": choose **More info → Run anyway**. Setup asks
+   for administrator rights, because it adds the face sign-in tile to the lock
+   screen.
+3. When it finishes, first-run setup opens and walks you through the rest:
+   camera, your Windows account password (not your PIN), about a minute of
+   face capture, and a few preferences. The first start downloads the face
+   model once (about 130 MB), so be online for it.
+4. Try it: press Windows+L, step away for a moment, come back and look at the
+   camera.
+
+Your PIN and password always keep working. To remove it: *Settings → Apps →
+Windows Face Unlock → Uninstall*. Starting Windows in Safe Mode also turns
+off third-party sign-in tiles.
+
 ## What it does
 
 - **Face sign-in on the lock screen** through a Windows Credential Provider
@@ -56,8 +75,9 @@ thin client that talks to the Python service over `\\.\pipe\FaceUnlock`
   inside your session (DPAPI user scope). Running before sign-in would mean
   storing a secret any administrator could recover, so it is not done.
 - **This is not Windows Hello.** A normal webcam cannot measure depth.
-  Anti-spoofing (photo/screen detection) is optional and off in the shipped
-  personal configuration; without it a good photo of you could unlock the PC.
+  Photo protection (a liveness check for photos and screens) is on by
+  default; if it turns you away in poor light you can switch it off in
+  Settings, but then a good photo of you could unlock the PC.
 - **No setting can guarantee every other face is rejected.** Stricter
   matching makes it less likely at the cost of asking for your PIN more often.
   Evidence collected from *you* can show you are still recognised; it cannot
@@ -80,7 +100,7 @@ asks a few preferences. See [INSTALL.md](INSTALL.md) and
 
 ```powershell
 .\.venv\Scripts\pip install -r requirements-dev.txt
-.\.venv\Scripts\python -m unittest discover -s tests     # 200+ tests, no camera needed
+.\.venv\Scripts\python -m unittest discover -s tests     # 270+ tests, no camera needed
 .\.venv\Scripts\ruff check .
 .\.venv\Scripts\python -m tools.ui_preview out\          # render every screen to PNG
 .\.venv\Scripts\python -m tools.bench 5                  # time recognition checks (camera)
@@ -111,6 +131,8 @@ and a privacy notice and consent flow for biometric data. See
 
 ## Credits
 
+Grew from [caochitam/windows-face-unlock](https://github.com/caochitam/windows-face-unlock)
+by Cao Chí Tâm. Built with
 [serengil/deepface](https://github.com/serengil/deepface),
 [OpenCV / YuNet](https://github.com/opencv/opencv_zoo),
 [Qt for Python](https://doc.qt.io/qtforpython/) (LGPL-3.0),
@@ -120,4 +142,4 @@ and Microsoft's
 
 ## Licence
 
-MIT – see [LICENSE](LICENSE).
+MIT – see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
