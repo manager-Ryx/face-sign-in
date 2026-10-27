@@ -19,6 +19,7 @@ from ..widgets import (
     button,
     hbox,
     label,
+    show_toast,
     subtle_button,
 )
 
@@ -332,9 +333,17 @@ class LearningPage(Page):
         self.controller.client.request({"cmd": "insights", "days": 30}, done, timeout_s=15.0)
 
     def _set(self, **changes) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        from .settings import row_of
         ok, problem = self.controller.update_config(**changes)
         if not ok:
             self.notice.setText(f"Couldn't change that: {problem}")
+            show_toast(self, f"Not saved: {problem}", "critical")
+            return
+        row = row_of(QApplication.focusWidget())   # the switch or list just used
+        if row is not None:
+            row.flash_saved()
 
     # ---- rendering ---------------------------------------------------------------
 
@@ -518,8 +527,11 @@ class LearningPage(Page):
 
     def _service(self, request: dict, message: str) -> None:
         def done(reply) -> None:
-            self.notice.setText(message if reply and reply.get("ok")
-                                else "That didn't work: Face Unlock isn't responding.")
+            ok = bool(reply and reply.get("ok"))
+            text = message if ok else ("That didn't work: Face Unlock isn't responding. Try "
+                                       "again in a moment.")
+            self.notice.setText(text)
+            show_toast(self, text, "success" if ok else "critical")
             self.load()
             self.controller.client.refresh_status()
         self.controller.client.request(request, done, timeout_s=15.0)
@@ -571,6 +583,8 @@ class LearningPage(Page):
                 return
             ok, problem = self.controller.update_config(**reply["config"])
             self.notice.setText("Settings restored." if ok else f"Couldn't restore: {problem}")
+            show_toast(self, "Settings restored" if ok else f"Couldn't restore: {problem}",
+                       "success" if ok else "critical")
             self.load()
 
         self.controller.client.request({"cmd": "snapshot_restore", "index": index}, done)

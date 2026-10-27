@@ -1,9 +1,12 @@
 """Everyday settings, in plain English."""
 from __future__ import annotations
 
+from dataclasses import MISSING, fields
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QHBoxLayout, QSpinBox, QWidget
+
+from face_service.config import Config
 
 from ..icons import G
 from ..status import duration
@@ -17,35 +20,66 @@ from ..widgets import (
     subtle_button,
 )
 
+DEFAULTS = {f.name: f.default for f in fields(Config) if f.default is not MISSING}
+
+
+def row_of(widget: QWidget | None) -> SettingRow | None:
+    """The setting row a control sits in, if any."""
+    while widget is not None and not isinstance(widget, SettingRow):
+        widget = widget.parentWidget()
+    return widget
+
 if TYPE_CHECKING:
     from ...app import AppController
 
 
 class Bindings:
-    """Keeps controls in sync with the configuration and saves edits."""
+    """Keeps controls in sync with the configuration and saves edits.
+
+    Every saved change is confirmed with a tick beside its control, and a setting
+    that differs from its default offers "back to the default".
+    """
 
     def __init__(self, controller: AppController, page: Page, banner: Banner):
         self.controller = controller
         self.page = page
         self.banner = banner
         self._sync: list = []
+        self._resets: set[str] = set()
 
-    def save(self, **changes: Any) -> None:
+    def save(self, source: QWidget | None = None, **changes: Any) -> bool:
         ok, problem = self.controller.update_config(**changes)
         if ok:
             self.banner.hide()
+            row = row_of(source)
+            if row is not None:
+                row.flash_saved()
         else:
             self.banner.show_message("critical", "That setting wasn't saved", problem)
             self.refresh()
+        return ok
+
+    def _offer_reset(self, key: str, control: QWidget, current: Any, default_text: str) -> None:
+        """Show "back to the default" on the control's row while it isn't the default."""
+        row = row_of(control)
+        if row is None or key not in DEFAULTS:
+            return
+        if key not in self._resets:
+            self._resets.add(key)
+            row.reset_button.clicked.connect(lambda: self.save(control, **{key: DEFAULTS[key]}))
+        row.show_reset(None if current == DEFAULTS[key] else default_text)
 
     def toggle(self, key: str, *, invert: bool = False) -> ToggleSwitch:
         switch = ToggleSwitch()
-        switch.toggled.connect(lambda on: self.save(**{key: (not on) if invert else on}))
+        switch.toggled.connect(lambda on: self.save(switch, **{key: (not on) if invert else on}))
 
         def sync(cfg) -> None:
             switch.blockSignals(True)
             switch.setChecked((not getattr(cfg, key)) if invert else bool(getattr(cfg, key)))
             switch.blockSignals(False)
+            default = DEFAULTS.get(key)
+            self._offer_reset(key, switch, getattr(cfg, key),
+                              "On" if bool(default) != invert else "Off")
         self._sync.append(sync)
         return switch
 
@@ -53,6 +87,13 @@ class Bindings:
                describe=None) -> QComboBox:
         combo = QComboBox()
         combo.setFixedWidth(240)  # one width for every choice, so right edges line up
+        default = DEFAULTS.get(key)
+
+        def text_for(text: str, option: Any) -> str:
+            # The default is marked, unless the wording already recommends it.
+            if option == default and "recommended" not in text:
+                return f"{text} (default)"
+            return text
 
         def sync(cfg) -> None:
             value = getattr(cfg, key)
@@ -60,12 +101,16 @@ class Bindings:
             combo.clear()
             known = [v for _, v in options]
             for text, option in options:
-                combo.addItem(text, option)
+                combo.addItem(text_for(text, option), option)
             if value not in known:
                 combo.addItem(describe(value) if describe else str(value), value)
             combo.setCurrentIndex(combo.findData(value))
             combo.blockSignals(False)
-        combo.activated.connect(lambda _i: self.save(**{key: combo.currentData()}))
+            default_text = next((t for t, o in options if o == default), None)
+            if default_text is None and default is not None:
+                default_text = describe(default) if describe else str(default)
+            self._offer_reset(key, combo, value, default_text or "")
+        combo.activated.connect(lambda _i: self.save(combo, **{key: combo.currentData()}))
         self._sync.append(sync)
         return combo
 
@@ -88,7 +133,12 @@ class Bindings:
             spin.blockSignals(True)
             spin.setValue(float(value) if decimals else int(round(value)))
             spin.blockSignals(False)
-        spin.valueChanged.connect(lambda v: self.save(**{key: v}))
+            default = DEFAULTS.get(key)
+            if default is not None:
+                self._offer_reset(key, spin, value,
+                                  f"{default:.{decimals}f}{suffix}" if decimals
+                                  else f"{default:g}{suffix}")
+        spin.valueChanged.connect(lambda v: self.save(spin, **{key: v}))
         self._sync.append(sync)
         return spin
 
@@ -99,8 +149,10 @@ class Bindings:
 
 class SettingsPage(Page):
     def __init__(self, controller: AppController):
-        super().__init__("Settings")
+        super().__init__("Settings", "Changes are saved as you make them. A tick shows each "
+                         "one was saved; \u21b6 puts a setting back to its default.")
         self.controller = controller
+        self.add_search()
         self.banner = self.add(Banner())
         b = self.bindings = Bindings(controller, self, self.banner)
 
@@ -126,7 +178,11 @@ class SettingsPage(Page):
                              "\"Only me\" also locks when someone else sits at your PC.",
                              b.choice("presence_mode", [("Only me", "recognition"),
                                                         ("Anyone in front of the camera",
-                                                         "detection")])))
+                                                         "detection")]),
+                             explain="\"Only me\" recognises your face at each check, so "
+                             "the PC also locks if someone else sits down. \"Anyone\" only "
+                             "looks for a face: a little faster and more forgiving in poor "
+                             "light, but anyone keeps it unlocked."))
         group.add(SettingRow(G.PAUSE, "Skip checks while Windows is locked",
                              "The sign-in screen already looks for you, so the extra checks "
                              "aren't needed.", b.toggle("presence_pause_while_locked")))
@@ -137,7 +193,11 @@ class SettingsPage(Page):
                              "Scans continuously when you're likely to be back soon – right after "
                              "you leave, and around the times you usually return – and takes "
                              "quick looks the rest of the time. Uses only when you lock and sign "
-                             "in, kept as counts on this PC.", b.toggle("unlock_learn_routine")))
+                             "in, kept as counts on this PC.", b.toggle("unlock_learn_routine"),
+                             explain="It counts when you lock and come back (for example "
+                             "weekday lunchtimes), never what you do. The camera then scans "
+                             "continuously only when you're likely to be back, which saves "
+                             "power and keeps the camera light off the rest of the time."))
         group.add(SettingRow(G.SCAN, "Keep looking for me for",
                              "The camera scans continuously this long after you leave, so you're "
                              "signed in the moment you sit down; after that it takes quick looks. "
@@ -185,7 +245,8 @@ class SettingsPage(Page):
         focus_layout.setContentsMargins(0, 0, 0, 0)
         focus_layout.setSpacing(8)
         self.focus_auto = subtle_button("Use automatic focus",
-                                        lambda: self.bindings.save(camera_focus=0))
+                                        lambda: self.bindings.save(self.focus_auto,
+                                                                   camera_focus=0))
         self.focus_set = button("Set focus for my desk", self._calibrate_focus)
         focus_layout.addWidget(self.focus_auto)
         focus_layout.addWidget(self.focus_set)
@@ -198,8 +259,12 @@ class SettingsPage(Page):
                              b.choice("theme", [("Use my Windows setting", "system"),
                                                 ("Light", "light"), ("Dark", "dark")])))
         group.add(SettingRow(G.INFO, "Show notifications",
-                             "For example when your camera is disconnected.",
+                             "For example when your camera is disconnected. Selecting a "
+                             "notification opens what fixes it.",
                              b.toggle("notifications")))
+        group.add(SettingRow(G.VOLUME, "Play a sound for each photo",
+                             "A soft shutter click while face setup takes your photos, and a "
+                             "chime when it's done.", b.toggle("capture_sounds")))
         self.finish()
         controller.config_changed.connect(lambda _c: self.refresh())
         controller.status_changed.connect(lambda _s: self._camera_text())
@@ -219,14 +284,14 @@ class SettingsPage(Page):
             "do and select \u201cSet focus for my desk\u201d (about 10 seconds).")
 
     def _calibrate_focus(self) -> None:
-        self.focus_set.setEnabled(False)
+        self.focus_set.set_busy(True, "Measuring\u2026")
         self.focus_row.set_description("Measuring \u2013 sit as you normally do and look at the "
                                        "screen for about 10 seconds\u2026")
 
         def done(reply) -> None:
-            self.focus_set.setEnabled(True)
+            self.focus_set.set_busy(False)
             if reply and reply.get("ok"):
-                self.bindings.save(camera_focus=int(reply["position"]))
+                self.bindings.save(self.focus_set, camera_focus=int(reply["position"]))
             else:
                 self.banner.show_message("caution", "Focus not set", (reply or {}).get(
                     "message") or "Face Unlock isn't responding.")

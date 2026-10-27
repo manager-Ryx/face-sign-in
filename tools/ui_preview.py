@@ -17,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+os.environ["FACE_UNLOCK_STILL"] = "1"   # no animations or sounds in renders
 if "FACE_UNLOCK_HOME" not in os.environ:
     os.environ["FACE_UNLOCK_HOME"] = tempfile.mkdtemp(prefix="face-unlock-preview-")
 
@@ -161,6 +162,14 @@ class DemoController(QObject):
         return lambda *args, **kwargs: None
 
 
+def offscreen(widget) -> None:
+    """Show a window without putting it on screen, so its layout is exactly as in use."""
+    from PySide6.QtCore import Qt
+    widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    widget.show()
+    QApplication.processEvents()
+
+
 def render(output: Path, theme_name: str, scale: float) -> list[Path]:
     from presence_monitor.ui.enroll import EnrollWizard
     from presence_monitor.ui.main_window import PAGES, MainWindow
@@ -168,6 +177,7 @@ def render(output: Path, theme_name: str, scale: float) -> list[Path]:
     controller = DemoController(app, theme_name)
     window = MainWindow(controller)  # type: ignore[arg-type]
     window.resize(round(1120 * scale), round(820 * scale))
+    offscreen(window)
     written = []
     for key, *_ in PAGES:
         window.stack.setCurrentWidget(window.pages[key])
@@ -194,12 +204,135 @@ def render(output: Path, theme_name: str, scale: float) -> list[Path]:
             written.append(full)
     wizard = EnrollWizard(controller, "append", None)  # type: ignore[arg-type]
     wizard.resize(800, 760)
+    offscreen(wizard)
     for _ in range(3):
         app.processEvents()
     path = output / f"{theme_name}-setup.png"
     wizard.grab().save(str(path))
     written.append(path)
+    written += _render_capture(app, controller, wizard, output, theme_name)
+    written += _render_extras(app, controller, window, output, theme_name)
     written += _render_onboarding(app, controller, output, theme_name)
+    return written
+
+
+def demo_frame(face_level: int = 150):
+    """A made-up camera picture: a soft background and an oval "face" (no real person)."""
+    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtGui import QBrush, QImage, QPainter, QRadialGradient
+    image = QImage(640, 480, QImage.Format.Format_RGB888)
+    image.fill(QColor(70, 78, 90))
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    glow = QRadialGradient(QPointF(320, 200), 380)
+    glow.setColorAt(0, QColor(120, 130, 145))
+    glow.setColorAt(1, QColor(45, 50, 60))
+    painter.fillRect(image.rect(), QBrush(glow))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(60, 66, 80))
+    painter.drawRoundedRect(QRectF(180, 330, 280, 200), 120, 120)     # shoulders
+    painter.setBrush(QColor(face_level, round(face_level * 0.82), round(face_level * 0.7)))
+    painter.drawEllipse(QRectF(250, 110, 140, 190))                   # face
+    painter.end()
+    return image
+
+
+def demo_observation(guidance: str, wanted: str | None, face_brightness: float,
+                     issues: tuple[str, ...] = ()):
+    from face_service.quality import FaceBox, ImageQuality
+    from presence_monitor.ui.capture import Observation
+    quality = ImageQuality(frame_brightness=105.0, face_brightness=face_brightness,
+                           issues=issues)
+    return Observation(guidance, "good" if not issues else "issue", False, wanted,
+                       FaceBox(250, 110, 140, 190), quality, wanted)
+
+
+def _render_capture(app, controller, wizard, output: Path, theme_name: str) -> list[Path]:
+    """Face capture under way (a made-up picture), and its "all done" page."""
+    written = []
+    wizard._go(1)
+    wizard._update_progress(9, 20)
+    wizard._on_preview(demo_frame(), demo_observation(
+        "Slowly turn your head a little to your left.", "left", 128.0))
+    wizard.turn_hint._set_phase(0.8)
+    for _ in range(3):
+        app.processEvents()
+    path = output / f"{theme_name}-setup-capture.png"
+    wizard.grab().save(str(path))
+    written.append(path)
+    wizard._on_preview(demo_frame(70), demo_observation(
+        "Your face is too dark. Turn on a light or face a window.", "center", 52.0,
+        ("low_contrast",)))
+    for _ in range(3):
+        app.processEvents()
+    path = output / f"{theme_name}-setup-capture-dark.png"
+    wizard.grab().save(str(path))
+    written.append(path)
+    wizard._go(3)
+    wizard.done_title.setText("All done: face profile saved")
+    wizard.done_text.setText("Face Unlock now has 74 reference photos and 12 learned samples. "
+                             "It uses them straight away on the lock screen.")
+    for _ in range(3):
+        app.processEvents()
+    path = output / f"{theme_name}-setup-done.png"
+    wizard.grab().save(str(path))
+    written.append(path)
+    wizard.hide()
+    return written
+
+
+def _render_extras(app, controller, window, output: Path, theme_name: str) -> list[Path]:
+    """Settings search, a toast, Copy diagnostics and the password dialog."""
+    from unittest.mock import patch
+
+    from presence_monitor.ui import dialogs
+    from presence_monitor.ui.widgets import show_toast
+    written = []
+
+    def shot(widget, name: str) -> None:
+        for _ in range(4):
+            app.processEvents()
+        path = output / f"{theme_name}-{name}.png"
+        widget.grab().save(str(path))
+        written.append(path)
+
+    window.open_page("settings")
+    settings = window.pages["settings"]
+    settings.search.setText("camera")
+    shot(window, "settings-search")
+    settings.search.setText("zebra")
+    shot(window, "settings-search-none")
+    settings.search.setText("")
+    window.open_page("home")
+    show_toast(window.pages["home"], "Auto-lock paused for 15 minutes", "info",
+               action=("Undo", lambda: None))
+    shot(window, "home-toast")
+    window._toast.deleteLater()
+
+    report = ("Face Unlock diagnostics\nCreated 2026-10-28 14:02\n\n== Checks ==\n"
+              "[OK  ] Starts at sign-in: tasks\n[OK  ] Background service: running\n"
+              "[TODO] Lock-screen tile: not installed\n\n== Service status ==\n{...}\n")
+    with patch("presence_monitor.diagnostics.collect", return_value=report), \
+            patch("presence_monitor.ui.dialogs.microsoft_account", return_value=None):
+        dialog = dialogs.DiagnosticsDialog(controller, None,
+                                           folder=Path(os.environ["FACE_UNLOCK_HOME"]) / "Downloads")
+        dialog.resize(640, 640)
+        offscreen(dialog)
+        for _ in range(40):          # the report is put together on a worker thread
+            app.processEvents()
+            if dialog.report:
+                break
+            time.sleep(0.02)
+        shot(dialog, "diagnostics")
+        dialog.done(0)
+
+    with patch("presence_monitor.ui.dialogs.microsoft_account", return_value="you@example.com"):
+        dialog = dialogs.PasswordDialog(controller, None)
+    dialog.password.setText("example")
+    dialog.repeat.setText("exampel")
+    offscreen(dialog)
+    shot(dialog, "password-dialog")
+    dialog.done(0)
     return written
 
 
@@ -217,7 +350,8 @@ def _render_onboarding(app, controller, output: Path, theme_name: str) -> list[P
     with patch("presence_monitor.ui.onboarding.microsoft_account",
                return_value="you@example.com"):
         wizard = OnboardingWizard(controller, None, checks=checks)  # type: ignore[arg-type]
-    wizard.resize(820, 700)
+    wizard.resize(820, 720)
+    offscreen(wizard)
     wizard._local = {"tile": checks.tile_state(), "hello": False, "autostart": "tasks"}
     written = []
     for index in range(len(STEPS)):
@@ -228,6 +362,34 @@ def _render_onboarding(app, controller, output: Path, theme_name: str) -> list[P
         path = output / f"{theme_name}-welcome-{index + 1}.png"
         wizard.grab().save(str(path))
         written.append(path)
+    # The camera check running on Get ready (a made-up picture, a bit dark).
+    from presence_monitor.ui.capture import lighting
+    wizard._go(1)
+    wizard.timer.stop()
+    peek = wizard.peek
+    peek.toggle.setText("Turn camera off")
+    observation = demo_observation("", None, 66.0)
+    peek.preview.show_frame(demo_frame(95), observation)
+    peek.meter.show()
+    peek.meter.show_lighting(lighting(observation.quality))
+    peek.chooser.addItems(["Integrated Camera", "USB webcam"])
+    peek.chooser.show()
+    wizard.stack.currentWidget().verticalScrollBar().setValue(10_000)
+    for _ in range(3):
+        app.processEvents()
+    path = output / f"{theme_name}-welcome-2-camera.png"
+    wizard.grab().save(str(path))
+    written.append(path)
+    # Try it: recognised.
+    wizard._go(5)
+    wizard.test_state.done("success", "Recognised you. You're all set!")
+    wizard.test_state.icon.hide()
+    wizard.test_badge.show()
+    for _ in range(3):
+        app.processEvents()
+    path = output / f"{theme_name}-welcome-6-recognised.png"
+    wizard.grab().save(str(path))
+    written.append(path)
     # The model downloading, as it looks on the Get ready step.
     from copy import deepcopy
     original = controller.client.status
@@ -256,6 +418,7 @@ def _render_guides(app, output: Path, theme_name: str) -> list[Path]:
         guide = HelloOnlyGuide(None, hello_only=lambda value=hello_only: value)
         guide.timer.stop()
         guide.adjustSize()
+        offscreen(guide)
         for _ in range(3):
             app.processEvents()
         path = output / f"{theme_name}-guide-hello-only{state}.png"

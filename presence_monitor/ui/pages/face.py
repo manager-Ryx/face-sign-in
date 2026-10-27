@@ -14,11 +14,12 @@ from ..widgets import (
     Card,
     Page,
     Pill,
-    ProgressRing,
     accent_button,
     button,
+    fade_in,
     hbox,
     label,
+    show_toast,
     subtle_button,
 )
 
@@ -101,7 +102,10 @@ class FacePage(Page):
         self.add_button.setToolTip("Capture a few photos of how you look today, for example "
                                    "with new glasses or a beard, and add them to your profile.")
         self.restart_button = button("Start over…", self._start_over)
+        self.restart_button.setToolTip("Replace all your reference photos with new ones (the "
+                                       "old ones are backed up)")
         self.review_button = subtle_button("Review reference photos", self._review)
+        self.review_button.setToolTip("Find photos that look unlike the rest, and remove them")
         profile.body.addLayout(hbox(self.add_button, self.restart_button, None,
                                     self.review_button, stretch_at=3))
         self.add(profile)
@@ -112,18 +116,23 @@ class FacePage(Page):
                                   "frames and shows how closely each one matched.", "Body2",
                                   wrap=True))
         self.test_button = accent_button("Test", self._run_test)
+        self.test_button.setToolTip("Looks at the camera for a few seconds and shows how each "
+                                    "frame matched")
         self.record = QCheckBox("Use this test to help judge the strictness setting")
         self.record.setChecked(True)
         self.record.setToolTip("Stores the face signatures from this test (no photos) as "
                                "evaluation data. They are never used to sign you in.")
-        self.busy = ProgressRing(18)
-        self.busy.hide()
-        test.body.addLayout(hbox(self.test_button, self.busy, self.record, stretch_at=3))
+        test.body.addLayout(hbox(self.test_button, self.record, stretch_at=2))
+        self.verdict_icon = GlyphLabel(G.DONE, 18, tone="success")
         self.verdict = label("", "CardTitle", wrap=True)
         self.verdict_detail = label("", "Secondary", wrap=True)
         self.strip = FrameStrip()
-        for widget in (self.verdict, self.verdict_detail, self.strip):
+        verdict_row = hbox(self.verdict_icon, spacing=8)
+        verdict_row.addWidget(self.verdict, 1)
+        test.body.addLayout(verdict_row)
+        for widget in (self.verdict_icon, self.verdict, self.verdict_detail, self.strip):
             widget.hide()
+        for widget in (self.verdict_detail, self.strip):
             test.body.addWidget(widget)
         self.add(test)
 
@@ -157,6 +166,10 @@ class FacePage(Page):
         self.restart_button.setVisible(bool(anchors))
         self.review_button.setVisible(bool(anchors))
         self.test_button.setEnabled(bool(anchors) and status != {})
+        self.test_button.setToolTip(
+            "Looks at the camera for a few seconds and shows how each frame matched"
+            if anchors and status else "Set up face recognition first" if status
+            else "Face Unlock's background service isn't running")
         stored = bool(status.get("credentials"))
         self.password_state.set_state("Stored" if stored else "Not stored",
                                       "success" if stored else "caution")
@@ -179,35 +192,43 @@ class FacePage(Page):
 
     def _password(self) -> None:
         from ..dialogs import PasswordDialog
-        PasswordDialog(self.controller, self).exec()
+        if PasswordDialog(self.controller, self).exec():
+            show_toast(self, "Password saved. Face sign-in will use it.")
         self.controller.client.refresh_status()
 
+    def _verdict(self, tone: str, text: str) -> None:
+        glyph = {"success": G.DONE, "caution": G.WARNING, "critical": G.ERROR}[tone]
+        self.verdict_icon.set_glyph(glyph, tone)
+        self.verdict_icon.show()
+        self.verdict.setText(text)
+        fade_in(self.verdict_icon, 240)
+
     def _run_test(self) -> None:
-        self.busy.show()
-        self.test_button.setEnabled(False)
+        self.test_button.set_busy(True, "Testing…")
+        self.verdict_icon.hide()
         self.verdict.setText("Looking at the camera…")
         self.verdict.show()
         self.verdict_detail.setText("")
         self.strip.hide()
 
         def done(reply) -> None:
-            self.busy.hide()
-            self.test_button.setEnabled(True)
+            self.test_button.set_busy(False)
             self.verdict_detail.show()
             if reply is None:
-                self.verdict.setText("Face Unlock isn't responding right now.")
+                self._verdict("critical", "Face Unlock isn't responding right now.")
                 return
             if not reply.get("ok"):
-                self.verdict.setText("The test couldn't run.")
+                self._verdict("caution", "The test couldn't run.")
                 self.verdict_detail.setText(guidance_text(reply.get("reason")) or
                                             reply.get("message", reason_text(reply.get("reason"))))
                 return
             frames = reply.get("frames", [])
             matches = sum(1 for f in frames if f["outcome"] == "match")
             if reply.get("accepted"):
-                self.verdict.setText(f"Recognised you ({matches} of {len(frames)} frames matched)")
+                self._verdict("success",
+                              f"Recognised you ({matches} of {len(frames)} frames matched)")
             else:
-                self.verdict.setText("Not recognised. " + guidance_text(reply.get("guidance")))
+                self._verdict("caution", "Not recognised. " + guidance_text(reply.get("guidance")))
             distances = [f["distance"] for f in frames if f.get("distance") is not None]
             detail = [f"Strictness in use: {reply.get('threshold', 0):.2f} (a frame matches at "
                       "or below this; lower numbers mean a closer match)."]
@@ -220,6 +241,7 @@ class FacePage(Page):
             self.verdict_detail.setText(" ".join(detail))
             self.strip.show_frames(frames, reply.get("threshold", 0.5))
             self.strip.show()
+            fade_in(self.strip)
 
         self.controller.client.request({"cmd": "check", "record": self.record.isChecked()},
                                        done, timeout_s=30.0)

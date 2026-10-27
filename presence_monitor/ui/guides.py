@@ -19,7 +19,7 @@ from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
 from .. import system_setup
 from .dialogs import Dialog
 from .icons import G, GlyphLabel
-from .widgets import ProgressRing, accent_button, button, hbox, label
+from .widgets import ProgressRing, SuccessBadge, accent_button, button, hbox, label
 
 GUIDES_DIR = Path(__file__).resolve().parent / "assets" / "guides"
 ANIMATION_SIZE = QSize(560, 315)   # 16:9; animations are scaled to fit
@@ -111,7 +111,7 @@ class HelloOnlyGuide(Dialog):
             row.addWidget(label(text, "Body", wrap=True), 1)
             self.body.addLayout(row)
         self.ring = ProgressRing(16)
-        self.done_mark = GlyphLabel(G.DONE, 16, tone="success")
+        self.done_mark = SuccessBadge(22)
         self.state = label("", "Body2", wrap=True)
         status = hbox(self.ring, self.done_mark, spacing=8)
         status.addWidget(self.state, 1)
@@ -135,6 +135,7 @@ class HelloOnlyGuide(Dialog):
             self.state.setText("Waiting for the switch to be turned off…")
             return
         self.timer.stop()
+        self.done_mark.play()
         self.state.setText("Done! Face Unlock can now appear on your lock screen.")
         self.close_button.setText("Done")
         self.close_button.setDefault(True)
