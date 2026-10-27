@@ -159,8 +159,10 @@ class HomePage(Page):
         elif self._action == "install-tile":
             c.install_tile()
         elif self._action == "hello-settings":
-            import os
-            os.startfile("ms-settings:signinoptions")  # type: ignore[attr-defined]
+            from ..guides import HelloOnlyGuide
+            HelloOnlyGuide(self).exec()
+            c.forget_system_state()
+            c.client.refresh_status()
         elif self._action == "password":
             from ..dialogs import PasswordDialog
             PasswordDialog(c, self).exec()

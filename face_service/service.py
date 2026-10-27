@@ -64,7 +64,11 @@ from .evaluation_store import EvaluationStore
 from .exposure import calibrate_focus
 from .logs import setup_logging
 from .metrics import MetricsStore
-from .models import provide_bundled_models, recognition_model_present
+from .models import (
+    download_recognition_model,
+    provide_bundled_models,
+    recognition_model_present,
+)
 from .pacing import LockScreenPacer
 from .pipe import ClientInfo, PipeServer
 from .profile import SOURCE_ENROLLMENT, SOURCE_MANUAL, SOURCE_PASSWORD, SOURCE_PRESENCE
@@ -199,6 +203,7 @@ class FaceService:
         self._rejections = 0
         self._rejected_password: float | None = None   # mtime of the stored password then
         self._model_error: str | None = None   # why the recognition model couldn't load
+        self._download: tuple[int, int] | None = None   # (bytes done, total) while fetching it
         self._preparing = threading.Lock()
         self._caller_seen: tuple[str | None, bool] | None = None
         self._device_status: tuple[float, dict] | None = None
@@ -858,6 +863,8 @@ class FaceService:
                             "model_loaded": self.recognizer.embedder.loaded,
                             "model_present": recognition_model_present(),
                             "model_error": self._model_error,
+                            "download": ({"done": self._download[0], "total": self._download[1]}
+                                         if self._download else None),
                             "compiled": self.recognizer.embedder.compiled_ok},
             "learning": {"enabled": self.cfg.adaptive_enrollment, "last": last_learned},
             "credentials": CREDS_PATH.exists(),
@@ -1130,6 +1137,7 @@ class FaceService:
             except Exception:
                 log.exception("face profile could not be loaded")
             if self.cfg.warmup_on_start:
+                self._fetch_model()
                 self._warm_model()
                 if self.cfg.anti_spoofing:
                     self.recognizer.embedder.load_spoof_model()  # failures show on the Overview
@@ -1161,6 +1169,21 @@ class FaceService:
             lines = str(exc).strip().splitlines()
             self._model_error = (lines[-1] if lines else type(exc).__name__)[:200]
 
+    def _fetch_model(self) -> None:
+        """Download the recognition model ourselves when it's missing, so setup can
+        show progress. If this fails, DeepFace's own download is tried next."""
+        def progress(done: int, total: int) -> None:
+            self._download = (done, total)
+
+        try:
+            if download_recognition_model(progress):
+                self._model_error = None
+        except Exception as exc:  # noqa: BLE001 - network, disk, checksum
+            log.warning("face model download failed: %s", exc)
+            self._model_error = f"download failed: {exc}"[:200]
+        finally:
+            self._download = None
+
     def _prepare_model(self) -> dict:
         """Try loading the models again (after a failed download, say), in the background."""
         if self.recognizer.embedder.loaded:
@@ -1170,6 +1193,7 @@ class FaceService:
 
         def run() -> None:
             try:
+                self._fetch_model()
                 self._warm_model()
                 if self.cfg.anti_spoofing:
                     self.recognizer.embedder.load_spoof_model()

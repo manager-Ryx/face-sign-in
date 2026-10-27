@@ -57,6 +57,8 @@ if weights_dir.exists():
             SERVICE_DATAS.append((str(p), "models/weights"))
 
 TRAY_DATAS = collect_data_files("cv2") + MODELS
+# The how-to guides' animations (presence_monitor/ui/assets/guides).
+TRAY_DATAS += [(str(REPO_ROOT / "presence_monitor" / "ui" / "assets"), "presence_monitor/ui/assets")]
 
 
 def metadata(*names):

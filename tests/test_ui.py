@@ -90,6 +90,24 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("too dark", guidance_text("too_dark"))
         self.assertEqual(when(None), "never")
 
+    def test_download_progress_in_plain_english(self) -> None:
+        from presence_monitor.ui.status import download_text
+        self.assertEqual(download_text(46_000_000, 137_000_000),
+                         "Downloading the face model: 46 of 137 MB.")
+        self.assertIn("about a minute left", download_text(46_000_000, 137_000_000, 1_400_000))
+        self.assertIn("about 3 minutes left", download_text(0, 137_000_000, 800_000))
+        self.assertIn("less than a minute", download_text(130_000_000, 137_000_000, 1e6))
+        self.assertIn("5 MB so far", download_text(5_000_000, 0))
+
+    def test_setup_shows_a_progress_bar_while_the_model_downloads(self) -> None:
+        from presence_monitor.ui.onboarding import CheckRow
+        row = CheckRow(None, "Face recognition model")
+        row.show_progress(50, 200, "Downloading")
+        self.assertFalse(row.bar.isHidden())
+        self.assertEqual(row.bar.value(), 250)
+        row.show_state("ok", "Ready.")
+        self.assertTrue(row.bar.isHidden())
+
 
 def box(nose_x: float, nose_y: float = 300.0) -> FaceBox:
     return FaceBox(220, 120, 200, 240, 0.95, left_eye=(370, 240), right_eye=(270, 240),
@@ -210,6 +228,35 @@ class SetupWizardTests(unittest.TestCase):
         controller.client.status = status(profile={"anchors": 0, "learned": 0})
         self.assertEqual(EnrollWizard(controller, "append", None).mode,  # type: ignore[arg-type]
                          "replace")
+
+
+class GuideTests(unittest.TestCase):
+    def test_a_placeholder_stands_in_until_the_animation_is_added(self) -> None:
+        from presence_monitor.ui.guides import HelloOnlyGuide
+        guide = HelloOnlyGuide(None, hello_only=lambda: True, animation=None)
+        self.assertIsNone(guide.animation.movie)
+        guide.done(0)
+
+    def test_webp_is_preferred_to_gif(self) -> None:
+        from presence_monitor.ui.guides import animation_file
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertIsNone(animation_file("hello-only", Path(folder)))
+            (Path(folder) / "hello-only.gif").write_bytes(b"GIF89a")
+            self.assertEqual(animation_file("hello-only", Path(folder)).suffix, ".gif")
+            (Path(folder) / "hello-only.webp").write_bytes(b"RIFF")
+            self.assertEqual(animation_file("hello-only", Path(folder)).suffix, ".webp")
+
+    def test_says_done_as_soon_as_the_setting_is_off(self) -> None:
+        from presence_monitor.ui.guides import HelloOnlyGuide
+        setting = [True]
+        guide = HelloOnlyGuide(None, hello_only=lambda: setting[0], animation=None)
+        self.assertTrue(guide.timer.isActive())
+        setting[0] = False  # the person turned it off in Settings
+        guide.refresh()
+        self.assertFalse(guide.timer.isActive())
+        self.assertEqual(guide.close_button.text(), "Done")
+        self.assertTrue(guide.open_button.isHidden())
+        guide.done(0)
 
 
 class RoutineTextTests(unittest.TestCase):

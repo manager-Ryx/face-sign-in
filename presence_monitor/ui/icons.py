@@ -54,6 +54,7 @@ class G:
     CHECKLIST = ""
     DIAGNOSTIC = ""
     NEW_WINDOW = ""
+    CHEVRON_RIGHT = ""
 
 
 def glyph_pixmap(glyph: str, color: str | QColor, size: int, dpr: float = 1.0) -> QPixmap:

@@ -206,6 +206,10 @@ class AppController(QObject):
         threading.Thread(target=lambda: self.tile_result.emit(*system_setup.install_tile()),
                          name="install-tile", daemon=True).start()
 
+    def forget_system_state(self) -> None:
+        """Check the registry again next time (a setting was just changed)."""
+        self._system = None
+
     def _tile_done(self, ok: bool, message: str) -> None:
         self._system = None
         if self.tray is not None:

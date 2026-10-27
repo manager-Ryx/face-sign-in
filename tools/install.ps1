@@ -167,8 +167,14 @@ if (-not $status) {
     $deadline = (Get-Date).AddMinutes(5)
     while ((Get-Date) -lt $deadline -and -not $status.recognition.model_loaded -and
            -not $status.recognition.model_error) {
-        Say 'Preparing the face model (it downloads once, about 130 MB)...'
-        Start-Sleep -Seconds 15
+        $download = $status.recognition.download
+        if ($download -and $download.total -gt 0) {
+            Say ('Downloading the face model: {0} of {1} MB' -f [math]::Floor($download.done / 1e6),
+                 [math]::Floor($download.total / 1e6))
+        } else {
+            Say 'Preparing the face model (it downloads once, about 130 MB)...'
+        }
+        Start-Sleep -Seconds 10
         $next = Get-ServiceStatus
         if ($next) { $status = $next }
     }

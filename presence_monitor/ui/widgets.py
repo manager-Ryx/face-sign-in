@@ -6,6 +6,8 @@ from collections.abc import Callable
 from PySide6.QtCore import (
     Property,
     QEasingCurve,
+    QEvent,
+    QObject,
     QPropertyAnimation,
     QRectF,
     QSize,
@@ -27,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import theme
-from .icons import GlyphLabel
+from .icons import G, GlyphLabel
 
 
 def restyle(widget: QWidget) -> None:
@@ -210,6 +212,7 @@ class SettingRow(QWidget):
             layout.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignTop)
         text = QVBoxLayout()
         text.setSpacing(2)
+        self.text_box = text
         self.title = label(title, "Body")
         self.description = label(description, "Secondary", wrap=True)
         text.addWidget(self.title)
@@ -437,6 +440,38 @@ class Page(QScrollArea):
 
     def refresh(self) -> None:
         """Called when the page becomes visible or data changes."""
+
+
+def caps_lock_on() -> bool:
+    import ctypes
+    return bool(ctypes.windll.user32.GetKeyState(0x14) & 1)  # VK_CAPITAL toggled
+
+
+class CapsLockWarning(QWidget):
+    """"Caps Lock is on", shown under password boxes while one of them has focus:
+    the most common reason a correct password is turned down."""
+
+    def __init__(self, *fields: QWidget, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(GlyphLabel(G.WARNING, 14, tone="caution"))
+        layout.addWidget(label("Caps Lock is on", "Caption"))
+        layout.addStretch(1)
+        self._fields = fields
+        for field in fields:
+            field.installEventFilter(self)
+        self.hide()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() in (QEvent.Type.FocusIn, QEvent.Type.FocusOut,
+                            QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            QTimer.singleShot(0, self.update_state)  # after Windows has toggled the key
+        return False
+
+    def update_state(self) -> None:
+        self.setVisible(any(f.hasFocus() for f in self._fields) and caps_lock_on())
 
 
 def hbox(*widgets: QWidget | None, spacing: int = 8, stretch_at: int | None = None) -> QHBoxLayout:

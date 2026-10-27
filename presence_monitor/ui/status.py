@@ -46,6 +46,22 @@ REASONS = {
 }
 
 
+def download_text(done: int, total: int, bytes_per_s: float | None = None) -> str:
+    """"Downloading the face model: 46 of 131 MB, about a minute left"."""
+    mb = 1_000_000
+    text = (f"Downloading the face model: {done // mb} of {total // mb} MB" if total
+            else f"Downloading the face model: {done // mb} MB so far")
+    if total and bytes_per_s and bytes_per_s > 0 and done < total:
+        seconds = (total - done) / bytes_per_s
+        if seconds < 50:
+            text += ", less than a minute left"
+        elif seconds < 90:
+            text += ", about a minute left"
+        else:
+            text += f", about {round(seconds / 60)} minutes left"
+    return text + "."
+
+
 def guidance_text(issue: str | None) -> str:
     return GUIDANCE.get(issue or "", "")
 
@@ -187,6 +203,10 @@ def summarize(status: dict | None, snapshot: dict, cfg: Config,
                         "Ready", "success") if anchors
                    else Tile("Not set up", "Face Unlock doesn't know your face yet.",
                              "Needs setup", "caution"))
+    download = (status.get("recognition") or {}).get("download")
+    if download:
+        recognition.detail = download_text(int(download.get("done", 0)),
+                                           int(download.get("total", 0)))
     learn = status.get("learning") or {}
     learning = (Tile("On", ("Last learned " + when(learn.get("last"))) if learn.get("last")
                      else "Nothing learned yet.", "On", "success") if learn.get("enabled")
@@ -247,7 +267,7 @@ def summarize(status: dict | None, snapshot: dict, cfg: Config,
         return out("caution", "Windows only allows Windows Hello sign-in",
                    "With this on, Windows hides Face Unlock on the lock screen. Turn off "
                    "\u201cFor improved security, only allow Windows Hello sign-in\u201d in "
-                   "Sign-in options.", "hello-settings", "Open Sign-in options", "attention",
+                   "Sign-in options.", "hello-settings", "Show me how", "attention",
                    "Hidden by Windows", "hello-only")
     tile = system.get("tile")
     if tile is not None and not tile.installed:

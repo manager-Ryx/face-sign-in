@@ -215,7 +215,7 @@ and look at the camera.
 
 | Symptom | What to do |
 |---|---|
-| No Face Unlock tile on the lock screen | Run `check_install.ps1`. If it says the tile isn't installed: Face Unlock → Overview → **Add to lock screen**. If Hello-only sign-in is on, the person turns off *Settings → Accounts → Sign-in options → "For improved security, only allow Windows Hello sign-in"*. Explain that this is their choice: it's a security setting |
+| No Face Unlock tile on the lock screen | Run `check_install.ps1`. If it says the tile isn't installed: Face Unlock → Overview → **Add to lock screen**. If Hello-only sign-in is on, the person turns off *Settings → Accounts → Sign-in options → "For improved security, only allow Windows Hello sign-in"*. The app's **Show me how** button (setup and the Overview) walks them through it and says when it's done. Explain that this is their choice: it's a security setting |
 | Tile says "Waiting for a verified face" | They can use their PIN or password. Read `%USERPROFILE%\.face-unlock\service.log` for the reason (`no_face`, `mismatch`, `just-locked`, ...) |
 | "Windows didn't accept your saved password" | Their Windows password changed. They store the new one in Face Unlock → Overview |
 | Not recognised in dim light | Better light on their face. Or turn off *photo protection* in Settings: it can reject real faces in poor light. Tell them it then can't tell a photo from a face |

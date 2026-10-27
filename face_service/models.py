@@ -7,10 +7,13 @@ service first needs them, any that are missing are copied into place.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
 import sys
+import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -65,3 +68,46 @@ def recognition_model_present() -> bool:
     """Is ArcFace available without downloading it?"""
     weights = deepface_weights_dir() / ARCFACE_WEIGHTS
     return weights.is_file() and weights.stat().st_size >= MIN_ARCFACE_BYTES
+
+
+# The file DeepFace 0.0.100 itself would fetch, and its SHA-256: a download that
+# doesn't match (cut short, altered on the way) is never used.
+ARCFACE_URL = "https://github.com/serengil/deepface_models/releases/download/v1.0/arcface_weights.h5"
+ARCFACE_SHA256 = "6336979c0c602cae08d1122a66f4dfb862d059bbcd8ef80306aef2b2249b0c93"
+
+
+def download_recognition_model(progress: Callable[[int, int], None] | None = None, *,
+                               url: str = ARCFACE_URL, sha256: str = ARCFACE_SHA256,
+                               timeout_s: float = 60.0) -> bool:
+    """Fetch ArcFace's weights where DeepFace looks for them, reporting
+    ``progress(done_bytes, total_bytes)`` as it goes (total is 0 if unknown).
+
+    Returns False if the model was already there. Raises on a failed download
+    or a file that doesn't match its checksum; nothing partial is left behind.
+    """
+    if recognition_model_present():
+        return False
+    from ._version import __version__
+    target = deepface_weights_dir() / ARCFACE_WEIGHTS
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial")
+    request = urllib.request.Request(url, headers={"User-Agent": f"face-unlock/{__version__}"})
+    digest = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response, \
+                open(partial, "wb") as out:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while chunk := response.read(1 << 20):
+                out.write(chunk)
+                digest.update(chunk)
+                done += len(chunk)
+                if progress is not None:
+                    progress(done, total)
+        if digest.hexdigest() != sha256:
+            raise ValueError("the downloaded face model didn't match its checksum")
+        os.replace(partial, target)
+    finally:
+        partial.unlink(missing_ok=True)
+    log.info("face model downloaded (%d MB)", target.stat().st_size // 1_000_000)
+    return True

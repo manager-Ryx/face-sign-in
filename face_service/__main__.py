@@ -47,9 +47,14 @@ def _smoke_test(report: str) -> int:
 
         from face_service._version import __version__
         from face_service.embedder import Embedder
-        from face_service.models import provide_bundled_models, recognition_model_present
+        from face_service.models import (
+            download_recognition_model,
+            provide_bundled_models,
+            recognition_model_present,
+        )
         result["version"] = __version__
         result["provided"] = provide_bundled_models()
+        result["downloaded"] = download_recognition_model()   # with its checksum check
         embedder = Embedder()
         embedder.load()
         result["recognition_model"] = recognition_model_present()

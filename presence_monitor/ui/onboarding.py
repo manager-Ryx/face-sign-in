@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLineEdit,
+    QProgressBar,
     QRadioButton,
     QStackedWidget,
     QVBoxLayout,
@@ -40,8 +42,10 @@ from .dialogs import (
     windows_account,
 )
 from .icons import G, GlyphLabel
+from .status import download_text
 from .widgets import (
     Banner,
+    CapsLockWarning,
     Card,
     ProgressRing,
     SettingRow,
@@ -127,12 +131,34 @@ class CheckRow(SettingRow):
         self.action = button("", None)
         for widget in (self.ring, self.mark, self.action):
             self.control_box.addWidget(widget, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(4)
+        self.bar.setAccessibleName(f"{title} progress")
+        # Its thin strip is kept while hidden, so nothing moves when a download starts.
+        policy = self.bar.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self.bar.setSizePolicy(policy)
+        self.bar.hide()
+        self.text_box.addSpacing(4)
+        self.text_box.addWidget(self.bar)
         self.ok = False
         self._slot = None
+
+    def show_progress(self, done: int, total: int, text: str) -> None:
+        """Working, with a bar: how far it is (or just busy, if the size is unknown)."""
+        self.show_state("working", text)
+        if total > 0:
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(min(1000, round(done * 1000 / total)))
+        else:
+            self.bar.setRange(0, 0)
+        self.bar.show()
 
     def show_state(self, state: str, text: str, action: str = "", slot=None) -> None:
         """``state``: ok, working, action or problem."""
         self.ok = state == "ok"
+        self.bar.hide()
         self.set_description(text)
         self.mark.setVisible(self.ok)
         self.ring.setVisible(state == "working")
@@ -156,6 +182,7 @@ class OnboardingWizard(QDialog):
         self._relay = _Relay(self)
         self._relay.done.connect(lambda callback, result: callback(result))
         self._busy: set[str] = set()
+        self._download_start: tuple[float, int] | None = None   # for "minutes left"
         self._camera_listed = False
         self._local: dict | None = None    # tile, Windows Hello-only, autostart
         self._ticks = 0
@@ -292,8 +319,11 @@ class OnboardingWizard(QDialog):
         self.secret.setAccessibleName("Windows password")
         self.secret.returnPressed.connect(self._save_password)
         self.secret.setMinimumWidth(320)
-        save = accent_button("Check and save", self._save_password)
-        layout.addLayout(hbox(self.secret, save, spacing=8, stretch_at=2))
+        self.save_button = accent_button("Check and save", self._save_password)
+        self.save_button.setEnabled(False)   # until there is something to check
+        self.secret.textChanged.connect(self._password_typed)
+        layout.addLayout(hbox(self.secret, self.save_button, spacing=8, stretch_at=2))
+        layout.addWidget(CapsLockWarning(self.secret))
         self.show_secret = QCheckBox("Show password")
         self.show_secret.toggled.connect(lambda shown: self.secret.setEchoMode(
             QLineEdit.EchoMode.Normal if shown else QLineEdit.EchoMode.Password))
@@ -376,6 +406,17 @@ class OnboardingWizard(QDialog):
         layout.addLayout(hbox(accent_button("Test recognition", self._test), self.test_ring,
                               self.test_state, spacing=10, stretch_at=2))
         layout.addLayout(hbox(button("Lock my PC now", self._lock), stretch_at=1))
+        tips = Card(padding=(18, 14), spacing=8)
+        for glyph, text in (
+                (G.FACE, "No need to click anything on the lock screen: just look at the "
+                         "camera."),
+                (G.KEY, "Your PIN and password still work, under “Sign-in options”."),
+                (G.POWER, "After a restart, sign in once with your PIN or password; face "
+                          "sign-in takes over from then.")):
+            row = hbox(GlyphLabel(glyph, 16, tone="accent"), spacing=10)
+            row.addWidget(label(text, "Body", wrap=True), 1)
+            tips.body.addLayout(row)
+        layout.addWidget(tips)
         self.summary = label("", "Secondary", wrap=True)
         layout.addWidget(self.summary)
         layout.addStretch(1)
@@ -477,8 +518,13 @@ class OnboardingWizard(QDialog):
         else:
             self.row_service.show_state("ok", "Running.")
             recognition = status.get("recognition") or {}
+            download = recognition.get("download")
             if recognition.get("model_loaded"):
                 self.row_model.show_state("ok", "Ready.")
+            elif download:
+                done, total = int(download.get("done", 0)), int(download.get("total", 0))
+                self.row_model.show_progress(done, total,
+                                             download_text(done, total, self._rate(done)))
             elif recognition.get("model_error"):
                 self.row_model.show_state(
                     "problem", "The face model couldn't be prepared "
@@ -500,7 +546,7 @@ class OnboardingWizard(QDialog):
             self.row_tile.show_state(
                 "problem", "Windows is set to allow only Windows Hello sign-in, which hides "
                 "Face Unlock. Turn off “For improved security, only allow Windows Hello "
-                "sign-in” in Sign-in options.", "Open Sign-in options", self._open_hello)
+                "sign-in” in Sign-in options.", "Show me how", self._open_hello)
         elif tile.installed:
             self.row_tile.show_state("ok", "Installed.")
         elif "tile" in self._busy:
@@ -573,23 +619,41 @@ class OnboardingWizard(QDialog):
             self.banner.show_message("caution", "Couldn't turn this on", message)
         self._check_local()
 
-    @staticmethod
-    def _open_hello() -> None:
-        import os
-        os.startfile("ms-settings:signinoptions")  # type: ignore[attr-defined]
+    def _open_hello(self) -> None:
+        from .guides import HelloOnlyGuide
+        HelloOnlyGuide(self).exec()
+        self._check_local()  # see the change straight away
+
+    def _rate(self, done: int) -> float | None:
+        """Download speed so far (bytes a second), from the first progress seen."""
+        now = time.monotonic()
+        if self._download_start is None or done < self._download_start[1]:
+            self._download_start = (now, done)
+            return None
+        started, first = self._download_start
+        return (done - first) / (now - started) if now - started >= 4 else None
 
     def _prepare_model(self) -> None:
         self.controller.client.request({"cmd": "prepare_model"},
                                        lambda _r: self.controller.client.refresh_status())
 
+    def _password_typed(self, text: str) -> None:
+        self.save_button.setEnabled(bool(text) and "password" not in self._busy)
+
     def _save_password(self) -> None:
         """Checking with Windows can take seconds on work PCs: off the UI thread."""
         user, domain = windows_account()
         secret = self.secret.text()
+        if not secret or "password" in self._busy:
+            return
         self.secret.clear()
+        self.save_button.setEnabled(False)
+        self.save_button.setText("Checking…")
         self.password_state.setText("Checking with Windows…")
 
         def done(result) -> None:
+            self.save_button.setText("Check and save")
+            self._password_typed(self.secret.text())
             ok, problem = result
             if not ok:
                 self.password_state.setText("")

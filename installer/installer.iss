@@ -56,6 +56,11 @@ Name: "cp"; Description: "Add face sign-in to the Windows lock screen (recommend
 #endif
 Name: "startuptray"; Description: "Start the Face Unlock tray at sign-in"; GroupDescription: "Windows integration"
 
+[InstallDelete]
+; Start from a clean program folder on upgrades: files left by an older version
+; (or copied in by hand) must never mix with this version's Python packages.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 ; The whole PyInstaller output. Inno Setup will recurse.
 Source: "{#BuildRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion

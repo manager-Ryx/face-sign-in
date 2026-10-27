@@ -228,6 +228,40 @@ def _render_onboarding(app, controller, output: Path, theme_name: str) -> list[P
         path = output / f"{theme_name}-welcome-{index + 1}.png"
         wizard.grab().save(str(path))
         written.append(path)
+    # The model downloading, as it looks on the Get ready step.
+    from copy import deepcopy
+    original = controller.client.status
+    downloading = deepcopy(original)
+    downloading["recognition"].update(model_loaded=False,
+                                      download={"done": 46_000_000, "total": 137_000_000})
+    controller.client.status = downloading
+    wizard._go(1)
+    wizard.timer.stop()
+    wizard._refresh_ready()
+    for _ in range(3):
+        app.processEvents()
+    path = output / f"{theme_name}-welcome-2-downloading.png"
+    wizard.grab().save(str(path))
+    written.append(path)
+    controller.client.status = original
+    written += _render_guides(app, output, theme_name)
+    return written
+
+
+def _render_guides(app, output: Path, theme_name: str) -> list[Path]:
+    """The how-to guides, waiting and done (no Windows setting is read)."""
+    from presence_monitor.ui.guides import HelloOnlyGuide
+    written = []
+    for state, hello_only in (("", True), ("-done", False)):
+        guide = HelloOnlyGuide(None, hello_only=lambda value=hello_only: value)
+        guide.timer.stop()
+        guide.adjustSize()
+        for _ in range(3):
+            app.processEvents()
+        path = output / f"{theme_name}-guide-hello-only{state}.png"
+        guide.grab().save(str(path))
+        written.append(path)
+        guide.done(0)
     return written
 
 

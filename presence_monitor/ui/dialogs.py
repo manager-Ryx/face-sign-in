@@ -25,7 +25,16 @@ from face_service.camera import list_cameras
 from face_service.config import ENROLL_DIR
 
 from .icons import G, GlyphLabel
-from .widgets import Banner, ProgressRing, accent_button, button, hbox, label, subtle_button
+from .widgets import (
+    Banner,
+    CapsLockWarning,
+    ProgressRing,
+    accent_button,
+    button,
+    hbox,
+    label,
+    subtle_button,
+)
 
 if TYPE_CHECKING:
     from ..app import AppController
@@ -206,6 +215,7 @@ class PasswordDialog(Dialog):
         self.show_box.toggled.connect(self._show)
         self.body.addWidget(self.password)
         self.body.addWidget(self.repeat)
+        self.body.addWidget(CapsLockWarning(self.password, self.repeat))
         self.body.addLayout(hbox(self.show_box,
                                  subtle_button("Forgot it?",
                                                lambda: open_password_help(self.email)),

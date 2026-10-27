@@ -214,12 +214,26 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("model-unavailable", status["not_ready"])
         self.assertEqual(status["recognition"]["model_error"], "url unreachable")
         embedder.load = lambda: None  # the internet is back
-        self.assertTrue(self.service.handle({"cmd": "prepare_model"}, USER)["started"])
-        for _ in range(100):
-            if self.service._model_error is None:
-                break
-            time.sleep(0.02)
+        with patch("face_service.service.download_recognition_model", return_value=False):
+            self.assertTrue(self.service.handle({"cmd": "prepare_model"}, USER)["started"])
+            for _ in range(100):
+                if self.service._model_error is None:
+                    break
+                time.sleep(0.02)
         self.assertIsNone(self.service._model_error)
+
+    def test_setup_sees_download_progress(self) -> None:
+        def slow_download(progress) -> bool:
+            progress(40_000_000, 137_000_000)
+            seen.append(self.service.status()["recognition"]["download"])
+            return True
+
+        seen: list = []
+        self.service.recognizer.embedder.loaded = False
+        with patch("face_service.service.download_recognition_model", side_effect=slow_download):
+            self.service._fetch_model()
+        self.assertEqual(seen, [{"done": 40_000_000, "total": 137_000_000}])
+        self.assertIsNone(self.service.status()["recognition"]["download"])
 
     def test_a_quick_restart_waits_for_the_old_service_to_go(self) -> None:
         import os
