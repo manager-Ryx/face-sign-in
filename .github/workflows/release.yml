@@ -45,7 +45,8 @@ jobs:
           # The exact versions the app was tested with: newer DeepFace releases, for
           # one, expect different model files than the ones bundled.
           pip install -r installer\requirements-lock.txt --extra-index-url https://download.pytorch.org/whl/cpu
-          pip install pyinstaller==6.11.1
+          # 6.11 can't package NumPy 2.5 (it leaves out numpy._core._exceptions).
+          pip install pyinstaller==6.22.3 pyinstaller-hooks-contrib==2026.9
 
       - name: Install Inno Setup
         shell: powershell

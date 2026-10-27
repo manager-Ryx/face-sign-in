@@ -45,6 +45,7 @@ def _smoke_test(report: str) -> int:
     try:
         import numpy as np
 
+        import face_service.service  # noqa: F401 - everything the running service imports
         from face_service._version import __version__
         from face_service.embedder import Embedder
         from face_service.models import (
