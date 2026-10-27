@@ -220,9 +220,13 @@ an hour. Now it would lock again after about 2 minutes.
   works (124 -> 164 lifted the face from 42 to 122).
 - **What happens.** When a face is visible after the camera settles and its
   brightness is outside 80-165, brightness is stepped towards 115 – at most
-  three steps of a few frames each, so about 0.1-0.6 s only when needed. The
-  offset that worked is remembered per kind of light (backlit, dim, dark,
-  bright) and tried first next time. Nothing changes when nobody is in view.
+  three steps of up to 30, each judged on the median of the last of six frames
+  (about 0.2 s each; 0.4 s in dim light), only when needed. The camera's own
+  auto-exposure keeps reacting after a change – a first, too-quick version
+  took a face from 61 to 235 live – so if the face ends up further from well
+  lit than it started, the camera's own brightness is put back. The offset
+  that worked is remembered per kind of light (backlit, dim, dark, bright) and
+  tried first next time. Nothing changes when nobody is in view.
 - **Bounds and undo.** Between -60 and +100 of the camera's own setting.
   Every change is put back when the camera is released; a marker file means
   even a crash can't leave the camera brighter for other apps (the next

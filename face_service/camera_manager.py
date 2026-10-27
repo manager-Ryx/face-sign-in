@@ -349,6 +349,9 @@ class CameraManager:
         if (result.lighting and result.face_after is not None
                 and FACE_LOW <= result.face_after <= FACE_HIGH):
             self.profile.observe_face_offset(result.lighting, result.offset)
+        if result.reverted:
+            log.info("face exposure for %s: no better than the camera's own setting (face %.0f); "
+                     "left as it was", purpose, result.face_before)
         if not result.adjusted:
             return settle
         log.info("face exposure for %s: brightness %+.0f, face %.0f -> %.0f (%s)", purpose,

@@ -17,11 +17,12 @@ BOX = FaceBox(200, 120, 220, 260, 0.95, (360, 200), (260, 200))
 
 
 class Detector:
-    def __init__(self, present: bool = True) -> None:
-        self.present = present
+    def __init__(self, present: bool = True, *, washes_out_at: float = 256.0) -> None:
+        self.present, self.washes_out_at = present, washes_out_at
 
     def detect_largest(self, bgr):
-        return BOX if self.present else None
+        face = float(bgr[120:380, 200:420].mean())
+        return BOX if self.present and face < self.washes_out_at else None
 
 
 class FakeCamera:
@@ -33,6 +34,7 @@ class FakeCamera:
             self.values[BRIGHTNESS] = 124.0
         self.originals: dict[int, float] = {}
         self.face, self.sharpest = face, sharpest
+        self.face_gain = 2.0                       # grey levels per brightness unit (measured)
         self.rng = np.random.default_rng(1)
 
     def control(self, prop):
@@ -50,7 +52,7 @@ class FakeCamera:
 
     def read_frame(self):
         offset = self.values.get(BRIGHTNESS, 124.0) - 124.0
-        face = float(np.clip(self.face + 2 * offset, 0, 255))
+        face = float(np.clip(self.face + self.face_gain * offset, 0, 255))
         frame = np.full((480, 640, 3), 200, dtype=np.uint8)   # a bright window
         blur = abs(self.values[FOCUS] - self.sharpest) / 120.0
         texture = self.rng.normal(0, 40 * np.exp(-blur * blur) + 1, (260, 220, 1))
@@ -85,6 +87,14 @@ class ExposureTests(unittest.TestCase):
                                  start_offset=lambda lighting: 40.0)
         self.assertEqual(result.steps, 1)
         self.assertEqual(result.offset, 40.0)
+
+    def test_a_change_that_makes_things_worse_is_undone(self) -> None:
+        camera = FakeCamera(face=60)
+        camera.face_gain = 8.0                     # the camera overreacts...
+        result = expose_for_face(camera, camera.read_frame(), Detector(washes_out_at=200))
+        self.assertTrue(result.reverted)           # ...washing the face out, so it's undone
+        self.assertFalse(result.adjusted)
+        self.assertEqual(camera.values[BRIGHTNESS], 124.0)
 
     def test_a_camera_without_a_brightness_control_is_left_alone(self) -> None:
         camera = FakeCamera(face=42, brightness=False)

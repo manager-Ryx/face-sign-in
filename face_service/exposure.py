@@ -6,8 +6,12 @@ your face dark – measured on this PC on a morning: face 42 against a scene of
 backlight-compensation control, but its brightness control works: raising it
 from 124 to 164 lifted the face to 122. So when a face is visible and badly
 lit, brightness is stepped towards a well-lit face (at most three steps,
-starting from what worked last time in the same light). Nothing changes when
-nobody is in view, and every change is undone when the capture closes
+starting from what worked last time in the same light). The camera's own
+auto-exposure keeps reacting for a moment after each change – live, one
+too-quick step took a face from 61 to 235 – so every step is small, is
+judged over several frames, and if the face ends up further from well lit
+than it started, the camera's own brightness is put back. Nothing changes
+when nobody is in view, and every change is undone when the capture closes
 (see :class:`face_service.camera.Camera`).
 
 Autofocus can hunt, especially at night. :func:`calibrate_focus` sweeps the
@@ -32,10 +36,12 @@ log = logging.getLogger(__name__)
 BRIGHTNESS = cv2.CAP_PROP_BRIGHTNESS
 FACE_TARGET = 115.0
 FACE_LOW, FACE_HIGH = 80.0, 165.0
-GAIN = 0.5                 # brightness units per grey level of face brightness (measured ~0.5)
+GAIN = 0.35                # brightness units per grey level (settled response ~0.5; AE overshoots)
+MAX_STEP = 30.0            # largest single change after the first
 MAX_RAISE, MAX_LOWER = 100.0, 60.0
 MAX_STEPS = 3
-SETTLE_FRAMES = 3          # frames for a brightness change to show
+SETTLE_FRAMES = 6          # frames for a change, and the camera's response to it, to show
+MEASURE_FRAMES = 3         # judged on the median of the last few
 MIN_STEP = 4.0
 
 FOCUS_SWEEP = tuple(range(100, 751, 50))
@@ -62,10 +68,11 @@ class Exposure:
     face_after: float | None = None
     steps: int = 0
     lighting: str = ""
+    reverted: bool = False            # it got worse, so the camera's own setting is back
 
     @property
     def adjusted(self) -> bool:
-        return self.steps > 0
+        return self.steps > 0 and not self.reverted
 
 
 def _face(frame: np.ndarray, detector: Detector) -> tuple[float, str] | None:
@@ -74,6 +81,14 @@ def _face(frame: np.ndarray, detector: Detector) -> tuple[float, str] | None:
         return None
     quality = assess(to_gray(frame), box)
     return quality.face_brightness, quality.lighting
+
+
+def _settled_face(camera: TunableCamera, detector: Detector
+                  ) -> tuple[np.ndarray, float | None]:
+    """Let a change land, then the face's median brightness (``None``: no face)."""
+    frames = [camera.read_frame() for _ in range(SETTLE_FRAMES)]
+    values = [seen[0] for seen in (_face(f, detector) for f in frames[-MEASURE_FRAMES:]) if seen]
+    return frames[-1], (statistics.median(values) if values else None)
 
 
 def expose_for_face(camera: TunableCamera, frame: np.ndarray | None, detector: Detector, *,
@@ -96,23 +111,27 @@ def expose_for_face(camera: TunableCamera, frame: np.ndarray | None, detector: D
     current = camera.control(BRIGHTNESS)
     if current is not None:
         offset = current - base            # a held camera may already be adjusted
+    measured: float | None = face
     for step in range(MAX_STEPS):
-        if FACE_LOW <= face <= FACE_HIGH:
+        if measured is None or FACE_LOW <= measured <= FACE_HIGH:
             break
-        wanted = (start if step == 0 and start is not None and not offset
-                  else offset + GAIN * (FACE_TARGET - face))
+        change = GAIN * (FACE_TARGET - measured)
+        if step == 0 and not offset and start is not None and start * change > 0:
+            wanted = start                 # what worked before in this light, same direction
+        else:
+            wanted = offset + max(-MAX_STEP, min(MAX_STEP, change))
         wanted = max(-MAX_LOWER, min(MAX_RAISE, wanted))
         if abs(wanted - offset) < MIN_STEP or not camera.set_control(BRIGHTNESS, base + wanted):
             break
         offset = wanted
         result.steps += 1
-        for _ in range(SETTLE_FRAMES):
-            frame = camera.read_frame()
-        seen = _face(frame, detector)
-        if seen is None:
-            break
-        face = seen[0]
-    result.frame, result.offset, result.face_after = frame, offset, face
+        frame, measured = _settled_face(camera, detector)
+    if result.steps and (measured is None
+                         or abs(measured - FACE_TARGET) > abs(face - FACE_TARGET)):
+        camera.set_control(BRIGHTNESS, base)   # worse than before: undo
+        frame, measured = _settled_face(camera, detector)
+        offset, result.reverted = 0.0, True
+    result.frame, result.offset, result.face_after = frame, offset, measured
     return result
 
 
