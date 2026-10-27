@@ -114,7 +114,7 @@ class SettingsPage(Page):
                              b.choice("presence_absence_timeout_s",
                                       [(duration(s), s) for s in (900, 1800, 2700, 3600, 5400,
                                                                   7200, 10800)],
-                                      lambda s: duration(s))))
+                                      lambda s: duration(s) if s else "After missed checks")))
         group.add(SettingRow(G.SCAN, "Check that I'm here every",
                              "Each check turns the camera on for about a second, then off "
                              "again. Locking can happen up to one interval later than the time "

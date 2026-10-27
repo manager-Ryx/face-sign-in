@@ -39,8 +39,8 @@ RELOCK_TRUST_S = 180.0       # signed straight back in after such a re-lock: you
 SIGN_IN_MATCH_S = 30.0       # a face sign-in this close to the unlock caused it
 
 
-def _lock_workstation() -> None:
-    ctypes.windll.user32.LockWorkStation()
+def _lock_workstation() -> bool:
+    return bool(ctypes.windll.user32.LockWorkStation())
 
 
 def pipe_call(request: dict, timeout_s: float = 10.0) -> dict | None:
@@ -262,14 +262,22 @@ class PresenceMonitor:
         return self._clock() - unlocked_at >= CONFIRM_AFTER_S
 
     def _lock(self, away_s: float, timeout: float, cause: str) -> None:
+        # The lock is ours, not yours: the service may welcome you back at once.
+        pipe_call({"cmd": "auto_lock", "away_s": round(away_s, 1)}, timeout_s=2.0)
+        if not _lock_workstation():
+            # Windows refused (rare: e.g. a remote session ending). Keep the
+            # absence timer running so the next check tries again, and withdraw
+            # the notice so a lock of your own isn't mistaken for this one.
+            log.warning("Windows did not lock the PC (error %s); will try again",
+                        ctypes.GetLastError())
+            pipe_call({"cmd": "auto_lock", "cancel": True}, timeout_s=2.0)
+            self.metrics.record("auto_lock_failed", cause=cause)
+            return
         self._reset_absence()
         self._lock_count += 1
         self._self_locked_at = self._clock()
         self.metrics.record("auto_lock", elapsed_s=round(away_s, 1), timeout_s=timeout,
                             cause=cause)
-        # The lock is ours, not yours: the service may welcome you back at once.
-        pipe_call({"cmd": "auto_lock", "away_s": round(away_s, 1)}, timeout_s=2.0)
-        _lock_workstation()
 
     # ---- the check -----------------------------------------------------------
 

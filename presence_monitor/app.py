@@ -67,6 +67,7 @@ class AppController(QObject):
     monitor_changed = Signal(object)
     session_event = Signal(str)
     tile_result = Signal(bool, str)
+    notice = Signal(str, str)        # (title, message) from a worker thread, for the GUI thread
 
     def __init__(self, app: QApplication):
         super().__init__()
@@ -97,6 +98,7 @@ class AppController(QObject):
         self._quitting = False
         self.client.status_changed.connect(self._watchdog)
         self.session_event.connect(self._on_session_event)
+        self.notice.connect(self._notify)
         hints = QGuiApplication.styleHints()
         hints.colorSchemeChanged.connect(self._on_system_scheme)
         # Settings edited outside the app (by hand or a tool) are picked up, so a
@@ -293,6 +295,11 @@ class AppController(QObject):
         if name == "lock" and self._wizard is not None and self._wizard.isVisible():
             self._wizard.pause_for_lock()
 
+    def capture_window_opened(self, wizard) -> None:
+        """A face-capture window opened elsewhere (first-run setup): like the one
+        from open_setup, it must give the camera back as soon as Windows locks."""
+        self._wizard = wizard
+
     # ---- actions ---------------------------------------------------------------
 
     def check_presence_now(self, callback=None) -> None:
@@ -317,12 +324,17 @@ class AppController(QObject):
 
         def worker() -> None:
             release = check_latest(timeout=8.0)
-            if release and release.is_newer_than(current_version()) and self.tray:
-                self.tray.notify("Update available",
-                                 f"Version {release.tag} is available from the original project. "
-                                 "Installing it would replace this customised version.")
+            if release and release.is_newer_than(current_version()):
+                # Qt widgets and pixmaps belong to the GUI thread: hand the notice over.
+                self.notice.emit("Update available",
+                                 f"Version {release.tag} is available from the project's "
+                                 "Releases page.")
 
         threading.Thread(target=worker, name="update-check", daemon=True).start()
+
+    def _notify(self, title: str, message: str) -> None:
+        if self.tray is not None:
+            self.tray.notify(title, message)
 
 
 def _activate_existing(message: bytes = b"show") -> bool:

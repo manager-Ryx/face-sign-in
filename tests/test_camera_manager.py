@@ -44,6 +44,8 @@ class FakeCamera:
 
     def close(self):
         self.closed = True
+        if getattr(self, "fail_close", None):
+            raise self.fail_close
 
 
 class CameraManagerTests(unittest.TestCase):
@@ -58,6 +60,12 @@ class CameraManagerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.manager.close()
         self.dir.cleanup()
+
+    def test_a_camera_that_fails_to_close_does_not_keep_it_locked(self) -> None:
+        with self.manager.session("presence") as session:
+            session.camera.fail_close = RuntimeError("device unplugged")
+        with self.manager.session("presence", wait_s=0.5):
+            pass  # would raise camera-busy if the first session had kept the lock
 
     def test_background_check_releases_the_camera_immediately(self) -> None:
         with self.manager.session("presence"):

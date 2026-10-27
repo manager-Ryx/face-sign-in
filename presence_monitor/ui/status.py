@@ -40,6 +40,8 @@ REASONS = {
     "caller-not-allowed": "Blocked caller", "stopped": "Service stopped", "error": "Error",
     "timeout": "Took too long", "preempted": "Interrupted", "starting": "Still starting",
     "just-locked": "Locked by you – waits until you step away",
+    "password-rejected": "Saved password out of date",
+    "anti-spoofing-unavailable": "Photo protection unavailable",
 }
 
 
@@ -227,6 +229,12 @@ def summarize(status: dict | None, snapshot: dict, cfg: Config,
                    "sign-in can work again – until then it won't try, so Windows doesn't count "
                    "failed sign-ins.", "password", "Update password", "attention",
                    "Needs your new password", "password-rejected")
+    if "anti-spoofing-unavailable" in (status.get("not_ready") or []):
+        return out("caution", "Photo protection couldn't start",
+                   "Its small model downloads once (this needs the internet), or PyTorch is "
+                   "missing. Face sign-in waits until it works. You can turn photo protection "
+                   "off in Settings.", "settings", "Open Settings", "attention",
+                   "Photo protection unavailable", "anti-spoofing-unavailable")
     system = system or {}
     if system.get("hello"):
         return out("caution", "Windows only allows Windows Hello sign-in",

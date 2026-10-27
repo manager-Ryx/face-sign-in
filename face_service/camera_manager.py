@@ -222,16 +222,25 @@ class CameraManager:
     def _close_camera(self) -> None:
         camera, self._camera = self._camera, None
         if camera is not None:
-            camera.close()
+            try:
+                camera.close()
+            except Exception as exc:  # noqa: BLE001 - e.g. cv2.error from an unplugged camera
+                log.warning("camera did not close cleanly: %s", exc)
             held = self._clock() - self._opened_at
             quick_look = self._opened_for == "unlock" and held < HELD_LOG_S
             log.log(logging.DEBUG if quick_look else logging.INFO,
                     "camera released after %.1f s", held)
 
     def release_now(self) -> None:
-        with self._lock:
+        # Called from the session-event thread: never wait long behind a session
+        # in progress, which closes or hands back the camera itself when it ends.
+        if not self._lock.acquire(timeout=1.0):
+            return
+        try:
             self._cancel_release_timer()
             self._close_camera()
+        finally:
+            self._lock.release()
 
     # ---- sessions ----------------------------------------------------------
 
@@ -270,17 +279,19 @@ class CameraManager:
             session = self._open_session(purpose)
             yield session
         finally:
-            hold = session.release_after if session and session.release_after else 0.0
-            if purpose == "unlock":
-                self._last_unlock_end = self._clock()
-            if not self.cfg().persistent_camera:
-                if hold > 0 and self._camera is not None:
-                    self._schedule_release(hold)
-                else:
-                    self._close_camera()
-            with self._state:
-                self._in_use_by = None
-            self._lock.release()
+            try:
+                hold = session.release_after if session and session.release_after else 0.0
+                if purpose == "unlock":
+                    self._last_unlock_end = self._clock()
+                if not self.cfg().persistent_camera:
+                    if hold > 0 and self._camera is not None:
+                        self._schedule_release(hold)
+                    else:
+                        self._close_camera()
+            finally:
+                with self._state:
+                    self._in_use_by = None
+                self._lock.release()
 
     def _open_session(self, purpose: str) -> CameraSession:
         cfg = self.cfg()

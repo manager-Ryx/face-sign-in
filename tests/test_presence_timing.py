@@ -98,6 +98,23 @@ class PresenceMonitorTests(unittest.TestCase):
         signed_in = {"face_sign_in_at": self.wall.now}
         return dict(ABSENT, **signed_in), dict(PRESENT, **signed_in)
 
+    def test_a_lock_windows_refuses_is_tried_again(self) -> None:
+        replies = iter([ABSENT] * 12)
+        sent: list[dict] = []
+
+        def service(request: dict, *args, **kwargs):
+            sent.append(request)
+            return next(replies) if request["cmd"] == "presence" else {"ok": True}
+
+        with patch("presence_monitor.monitor.pipe_call", side_effect=service), \
+                patch("presence_monitor.monitor._lock_workstation",
+                      side_effect=[False, True]) as lock:
+            for second in (0, 120, 240, 360, 480, 600, 720):
+                self.clock.now = second
+                self.monitor._tick()
+        self.assertEqual(lock.call_count, 2)  # the refused lock was retried at the next check
+        self.assertIn({"cmd": "auto_lock", "cancel": True}, sent)
+
     def test_walking_past_after_a_face_sign_in_locks_again_soon(self) -> None:
         away, _ = self.face_sign_in()
         lock = self.run_ticks([away] * 9, self.CONFIRM_TIMES, after_unlock=True)

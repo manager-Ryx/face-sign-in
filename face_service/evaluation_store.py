@@ -41,16 +41,22 @@ class EvaluationStore:
                                                                "session", "order")}
         except FileNotFoundError:
             self._rows = None
-        except (OSError, KeyError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - a damaged file (EOFError, BadZipFile, ...)
             log.warning("evaluation samples unreadable, starting fresh: %s", exc)
-            self._rows = None
+            self._rows, self._meta = None, {}
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(dir=self.path.parent, prefix="evaluation-", suffix=".npz")
-        with os.fdopen(fd, "wb") as handle:
-            np.savez(handle, embeddings=self._rows, **self._meta)
-        os.replace(name, self.path)
+        temp = Path(name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                np.savez(handle, embeddings=self._rows, **self._meta)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.path)
+        finally:
+            temp.unlink(missing_ok=True)
 
     def __len__(self) -> int:
         return 0 if self._rows is None else len(self._rows)

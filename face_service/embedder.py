@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,11 @@ from .quality import FaceBox
 log = logging.getLogger(__name__)
 
 PARITY_TOLERANCE = 1e-4  # cosine distance
+SPOOF_RETRY_S = 60.0     # a failed liveness-model load (e.g. offline) is retried this often
+
+
+class SpoofModelUnavailable(RuntimeError):
+    """Photo protection is on, but its liveness model could not be loaded."""
 
 
 @dataclass
@@ -57,6 +63,9 @@ class Embedder:
         self._compiled: Any = None
         self._input_shape: tuple[int, int] = (112, 112)
         self.compiled_ok: bool | None = None
+        self._spoof_ready = False
+        self._spoof_failed_at: float | None = None
+        self.spoof_error: str | None = None
 
     # ---- set-up ------------------------------------------------------------
 
@@ -86,6 +95,31 @@ class Embedder:
     @property
     def loaded(self) -> bool:
         return self._client is not None
+
+    def load_spoof_model(self) -> bool:
+        """Build DeepFace's liveness model (idempotent).
+
+        Returns False, with the reason in ``spoof_error``, when it can't be
+        loaded (PyTorch missing, or its weights absent while offline). A
+        failure is retried at most once a minute, so frames aren't held up by
+        repeated downloads.
+        """
+        with self._lock:
+            if self._spoof_ready:
+                return True
+            now = time.monotonic()
+            if self._spoof_failed_at is not None and now - self._spoof_failed_at < SPOOF_RETRY_S:
+                return False
+            try:
+                from deepface.modules import modeling
+
+                modeling.build_model(task="spoofing", model_name="Fasnet")
+            except Exception as exc:  # noqa: BLE001 - ImportError, ValueError, network errors
+                self._spoof_failed_at, self.spoof_error = now, str(exc) or type(exc).__name__
+                log.error("photo protection model unavailable: %s", self.spoof_error)
+                return False
+            self._spoof_ready, self._spoof_failed_at, self.spoof_error = True, None, None
+            return True
 
     def self_check(self, bgr: np.ndarray) -> float | None:
         """Compare against ``DeepFace.represent``; disable compilation on mismatch."""
@@ -119,6 +153,10 @@ class Embedder:
         from deepface.modules import detection, preprocessing
 
         self.load()
+        if anti_spoofing and not self.load_spoof_model():
+            # Never report "no face" for a model that isn't there: that would
+            # read as absence, and every sign-in would quietly fail.
+            raise SpoofModelUnavailable(self.spoof_error or "liveness model unavailable")
         with self._lock:
             # DeepFace's YuNet wrapper reads its score threshold from the
             # environment on every call; all inference is serialised by

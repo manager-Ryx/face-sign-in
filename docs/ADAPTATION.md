@@ -308,7 +308,7 @@ Generated from the code (`face_service/config.py`).
 | `auto_tighten_threshold` | You decide | `False` |  | Let the app make recognition stricter automatically once enough evidence shows it still recognises you reliably. |
 | `presence_enabled` | You decide | `True` |  | Lock the PC automatically when you have been away. |
 | `presence_interval_s` | You decide | `300` | 10-3600 | Seconds between presence checks. |
-| `presence_absence_timeout_s` | You decide | `0` | 0-86400 | Lock after roughly this many seconds without seeing you (0 uses the legacy strike count). |
+| `presence_absence_timeout_s` | You decide | `3600` | 0-86400 | Lock after roughly this many seconds without seeing you (0 uses the legacy strike count). |
 | `presence_absent_strikes` | You decide | `2` | 1-100 | Legacy: consecutive absent checks before locking, used only when the timeout is 0. |
 | `presence_mode` | You decide | `recognition` | recognition, detection | 'recognition' requires your face; 'detection' accepts any face. |
 | `presence_pause_while_locked` | You decide | `True` |  | Skip presence checks while Windows is locked. |

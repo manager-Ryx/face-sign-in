@@ -102,7 +102,8 @@ class ConfigRulesTests(unittest.TestCase):
             Config(adaptive_retention_days=-1.0).validate()
 
     def test_legacy_strikes_are_only_the_zero_timeout_fallback(self) -> None:
-        legacy = Config(presence_interval_s=60, presence_absent_strikes=3)
+        legacy = Config(presence_interval_s=60, presence_absent_strikes=3,
+                        presence_absence_timeout_s=0)
         explicit = Config(presence_interval_s=120, presence_absent_strikes=99,
                           presence_absence_timeout_s=600)
         self.assertEqual(legacy.effective_presence_absence_timeout_s, 180)

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import math
 import secrets
+import shutil
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -174,13 +175,32 @@ class Recognizer:
 
     def load(self) -> bool:
         with self._lock:
-            profile = load_profile(self.profile_path)
+            profile = self._read_profile_file()
             if profile is None:
                 self._profile = None
                 return False
             self._profile = profile
             self._apply_retention_locked(persist=True)
             return True
+
+    def _read_profile_file(self) -> FaceProfile | None:
+        """The saved profile, or None when there is none or it can't be read.
+
+        A damaged file (for example cut short by a power loss) is copied aside
+        so it can be recovered by hand, and the service keeps running: sign-in
+        reports "not set up" until the face is captured again.
+        """
+        try:
+            return load_profile(self.profile_path)
+        except Exception as exc:  # noqa: BLE001 - EOFError, BadZipFile, KeyError, ...
+            damaged = self.profile_path.with_name(self.profile_path.stem + ".damaged.npz")
+            try:
+                if not damaged.exists():
+                    shutil.copy2(self.profile_path, damaged)
+            except OSError:
+                pass
+            log.error("face profile unreadable (%s); a copy was kept as %s", exc, damaged.name)
+            return None
 
     def require_profile(self) -> FaceProfile:
         profile = self._profile
@@ -335,7 +355,7 @@ class Recognizer:
         with self._lock:
             current = self._profile if mode == "append" else None
             if mode == "append" and current is None:
-                current = load_profile(self.profile_path)
+                current = self._read_profile_file()
             consistency = None
             if current is not None and current.protected_count:
                 anchors_unit = current.unit_rows[: current.protected_count]

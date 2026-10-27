@@ -4,9 +4,11 @@ It owns the camera, the recognition model, the face profile, and the user's
 DPAPI-protected credential, and answers one JSON request per named-pipe
 connection (see :mod:`face_service.pipe`).
 
-Commands used by the Windows sign-in tile (protocol unchanged):
-  {"cmd":"unlock"}                       -> credential on a verified face, else a reason
-  {"cmd":"unlock_result","attempt_id":..., "accepted":bool}
+Commands used by the Windows sign-in tile:
+  {"cmd":"unlock", "selected":bool}      -> credential on a verified face, else a reason
+  {"cmd":"unlock_result","attempt_id":..., "accepted":bool, "status":int, "substatus":int}
+"selected" (you clicked the tile or pressed Enter) and the Windows status codes
+come from tiles of version 0.3 and later; older tiles omit them.
 
 Commands used by the tray app and tools:
   ping, status, insights, reload_config, shutdown,
@@ -56,7 +58,7 @@ from .config import (
 )
 from .credentials import load_password
 from .detector import FaceDetector
-from .embedder import Embedder
+from .embedder import Embedder, SpoofModelUnavailable
 from .evaluation import evaluate_threshold
 from .evaluation_store import EvaluationStore
 from .exposure import calibrate_focus
@@ -101,6 +103,18 @@ PRESENCE_LEARN_GAP_S = 600.0   # at most one view learned while you sit, per ten
 # of date. Stop replaying it (each attempt counts as a failed sign-in, and work PCs
 # may lock the account) until a new one is saved.
 PASSWORD_REJECTIONS = 2
+# Windows results that mean the stored password (or account name) itself is wrong.
+# Anything else - no domain controller, a locked account - says nothing about it.
+WRONG_PASSWORD_STATUS = frozenset({
+    0xC000006D,  # STATUS_LOGON_FAILURE
+    0xC000006A,  # STATUS_WRONG_PASSWORD
+    0xC0000064,  # STATUS_NO_SUCH_USER
+    0xC0000071,  # STATUS_PASSWORD_EXPIRED
+    0xC0000224,  # STATUS_PASSWORD_MUST_CHANGE
+})
+# A tile selection this soon after the lock is Windows setting up the sign-in
+# screen, not you asking to be let back in (Windows+L while facing the camera).
+SELECTION_ARMS_AFTER_S = 10.0
 CAUGHT_TEXT = {"instant": "by face straight away", "quick-look": "by face on a quick look",
                "other": "another way"}
 
@@ -128,6 +142,17 @@ class _LockSession:
     accepted_at: float | None = None
     accepted_mode: str | None = None
     reasons: dict[str, int] = field(default_factory=dict)
+
+
+def password_rejected(accepted: bool, status: Any, substatus: Any) -> bool:
+    """Did Windows turn down the stored password itself (not the network or policy)?"""
+    if accepted:
+        return False
+    codes = [c for c in (substatus, status) if isinstance(c, int) and not isinstance(c, bool)]
+    if not codes:
+        return True  # older tiles report only "rejected": assume the password
+    code = next((c for c in codes if c), 0) & 0xFFFFFFFF
+    return code in WRONG_PASSWORD_STATUS
 
 
 class FaceService:
@@ -290,10 +315,12 @@ class FaceService:
             return False
         return True
 
-    def _note_password_result(self, accepted: bool) -> None:
+    def _note_password_result(self, accepted: bool, rejected: bool = True) -> None:
         if accepted:
             self._rejections = 0
             return
+        if not rejected:
+            return  # failed for another reason (offline domain PC, locked account)
         self._rejections += 1
         if self._rejections >= PASSWORD_REJECTIONS and self._rejected_password is None:
             try:
@@ -506,13 +533,13 @@ class FaceService:
 
     # ---- core commands ------------------------------------------------------
 
-    def unlock(self, client: ClientInfo) -> dict:
+    def unlock(self, client: ClientInfo, selected: Any = None) -> dict:
         if not self._credentials_caller_ok(client):
             return {"ok": False, "reason": "caller-not-allowed"}
         started = self._clock()
         self._unlock_priority_until = started + UNLOCK_PRIORITY_GRACE_S
         self._ensure_lock_session()
-        ticket = self.pacer.begin()
+        ticket = self.pacer.begin(selected if isinstance(selected, bool) else None)
         face_seen = False
         verdict: Verdict | None = None
         session_ref: CameraSession | None = None
@@ -570,6 +597,9 @@ class FaceService:
         except NotEnrolledError:
             reason = "not-enrolled"
             return {"ok": False, "reason": "not-enrolled"}
+        except SpoofModelUnavailable:
+            reason = "anti-spoofing-unavailable"
+            return {"ok": False, "reason": reason}
         except CameraUnavailable as exc:
             reason = exc.reason
             return {"ok": False, "reason": exc.reason}
@@ -593,7 +623,9 @@ class FaceService:
             session = self._lock_session
             if session is None or session.armed:
                 return True
-            if face_seen and not interactive:
+            selected = (interactive
+                        and self._clock() - session.started >= SELECTION_ARMS_AFTER_S)
+            if face_seen and not selected:
                 return False
             session.armed = True
         log.info("face sign-in ready again: %s",
@@ -612,7 +644,8 @@ class FaceService:
                 now, eval_frame.embedding if eval_frame else None,
                 eval_frame.quality.lighting if eval_frame and eval_frame.quality else "unknown")
 
-    def unlock_result(self, attempt_id: Any, accepted: Any) -> dict:
+    def unlock_result(self, attempt_id: Any, accepted: Any, status: Any = None,
+                      substatus: Any = None) -> dict:
         if not isinstance(attempt_id, str) or not isinstance(accepted, bool):
             return {"ok": False, "reason": "invalid-unlock-result"}
         with self._attempts_lock:
@@ -621,7 +654,7 @@ class FaceService:
         if attempt is None:
             log.info("unlock result for an unknown, expired, or repeated attempt ignored")
             return {"ok": True, "added": 0}
-        self._note_password_result(accepted)
+        self._note_password_result(accepted, password_rejected(accepted, status, substatus))
         if accepted:
             self._face_sign_in_at = self._wall_clock()
             with self._session_lock:
@@ -669,6 +702,8 @@ class FaceService:
                 self._learn_while_present(verdict)
         except NotEnrolledError:
             return {"ok": False, "reason": "not-enrolled"}
+        except SpoofModelUnavailable:
+            return {"ok": False, "reason": "anti-spoofing-unavailable"}  # never "away"
         except CameraUnavailable as exc:
             return {"ok": True, "present": True, "skipped": exc.reason, "mode": mode}
         except CameraError as exc:
@@ -797,6 +832,8 @@ class FaceService:
             reasons.append("password-rejected")
         if device.get("state") != "ready":
             reasons.append(f"camera-{device.get('state')}")
+        if self.cfg.anti_spoofing and self.recognizer.embedder.spoof_error:
+            reasons.append("anti-spoofing-unavailable")
         ready = not reasons
         profile = self.recognizer.profile
         last_learned = None
@@ -850,9 +887,9 @@ class FaceService:
             "insights": lambda r, c: {"ok": True, **self.insights(float(r.get("days", 30)))},
             "reload_config": lambda r, c: self.reload_config(),
             "shutdown": lambda r, c: self.shutdown(),
-            "unlock": lambda r, c: self.unlock(c),
-            "unlock_result": lambda r, c: self.unlock_result(r.get("attempt_id"),
-                                                             r.get("accepted")),
+            "unlock": lambda r, c: self.unlock(c, r.get("selected")),
+            "unlock_result": lambda r, c: self.unlock_result(
+                r.get("attempt_id"), r.get("accepted"), r.get("status"), r.get("substatus")),
             "presence": lambda r, c: self.presence(),
             "check": lambda r, c: self.check(record=bool(r.get("record", True))),
             "verify": lambda r, c: self._legacy_verify(),
@@ -878,7 +915,8 @@ class FaceService:
             "clear_measurements": lambda r, c: self._clear_measurements(),
             "low_light_reset": lambda r, c: self._low_light_reset(),
             "routine_reset": lambda r, c: self._routine_reset(),
-            "auto_lock": lambda r, c: self._expect_auto_lock(r.get("away_s")),
+            "auto_lock": lambda r, c: self._expect_auto_lock(r.get("away_s"),
+                                                             r.get("cancel") is True),
             "calibrate_focus": lambda r, c: self._calibrate_focus(),
         }
 
@@ -1021,9 +1059,12 @@ class FaceService:
                                "normally do, facing the camera, and try again."}
         return {"ok": True, "position": result.best, "positions": result.faces_seen}
 
-    def _expect_auto_lock(self, away_s: Any) -> dict:
+    def _expect_auto_lock(self, away_s: Any, cancel: bool = False) -> dict:
         """The presence monitor is about to lock because you are away: the next lock
         is not yours, so face sign-in may welcome you back straight away."""
+        if cancel:  # Windows refused to lock
+            self._auto_lock_notice = None
+            return {"ok": True}
         valid = isinstance(away_s, (int, float)) and 0 <= away_s <= 7 * 86400
         self._auto_lock_notice = (self._clock(), float(away_s) if valid else 0.0)
         return {"ok": True}
@@ -1083,6 +1124,8 @@ class FaceService:
                 log.exception("face profile could not be loaded")
             if self.cfg.warmup_on_start:
                 self._warm_model()
+                if self.cfg.anti_spoofing:
+                    self.recognizer.embedder.load_spoof_model()  # failures show on the Overview
             self._device()
         finally:
             self._ready_reason = "ready"

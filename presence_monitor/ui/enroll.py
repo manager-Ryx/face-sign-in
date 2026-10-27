@@ -228,11 +228,18 @@ class EnrollWizard(QDialog):
     def __init__(self, controller: AppController, mode: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.controller = controller
-        status = controller.client.status or {}
-        self.has_profile = bool((status.get("profile") or {}).get("anchors"))
+        status = controller.client.status
+        anchors = (status.get("profile") or {}).get("anchors") if status else None
+        # Only a service that says there is no profile turns "add" into "replace":
+        # an unknown status (not answered yet) must never discard what was learned.
+        self.has_profile = anchors is None or bool(anchors)
         self.mode = mode if self.has_profile else "replace"
         self.staging: Path | None = None
         self.worker: CaptureWorker | None = None
+        # Stopped workers whose thread hasn't ended yet. Qt deletes a running
+        # QThread whose last Python reference goes away, which ends the process.
+        self._retired: list[CaptureWorker] = []
+        self._requesting = False
         self.plan: CapturePlan | None = None
         self._leased = False
         self.setWindowTitle("Set up face recognition")
@@ -388,7 +395,11 @@ class EnrollWizard(QDialog):
             self._go(0)
 
     def _start_capture(self, resume: bool = False) -> None:
+        if self._requesting or (self.worker is not None and self.worker.isRunning()):
+            return  # a double click: the camera is already on, or being handed over
+
         def leased(reply) -> None:
+            self._requesting = False
             if not reply or not reply.get("ok"):
                 self.banner.show_message(
                     "critical", "The camera isn't available",
@@ -406,6 +417,7 @@ class EnrollWizard(QDialog):
             self.secondary.setText("Pause")
             self.preview.show_message("Starting the camera…")
             self._update_progress(self.plan.taken, self.plan.total)
+            self._retire(self.worker)
             self.worker = CaptureWorker(self.controller, self.staging, self.plan)
             self.worker.preview.connect(self._on_preview)
             self.worker.captured.connect(self._update_progress)
@@ -414,8 +426,17 @@ class EnrollWizard(QDialog):
             self.worker.finished.connect(self._on_worker_finished)
             self.worker.start()
 
+        self._requesting = True
         self.controller.client.request({"cmd": "pause_camera", "owner": OWNER,
                                         "seconds": LEASE_S}, leased, timeout_s=12.0)
+
+    def _retire(self, worker: CaptureWorker | None) -> None:
+        """Keep a stopped worker alive until its thread has really ended."""
+        if worker is None or not worker.isRunning():
+            return
+        self._retired.append(worker)
+        worker.finished.connect(lambda w=worker: self._retired.remove(w)
+                                if w in self._retired else None)
 
     def _renew(self) -> None:
         def done(reply) -> None:
@@ -465,6 +486,7 @@ class EnrollWizard(QDialog):
         if worker is not None:
             worker.requestInterruption()
             worker.wait(3000)
+            self._retire(worker)
         self._release_camera()
 
     def _release_camera(self) -> None:

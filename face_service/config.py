@@ -214,7 +214,7 @@ class Config:
     presence_interval_s: int = _setting(
         300, P, "Seconds between presence checks.", minimum=10, maximum=3600)
     presence_absence_timeout_s: int = _setting(
-        0, P, "Lock after roughly this many seconds without seeing you "
+        3600, P, "Lock after roughly this many seconds without seeing you "
         "(0 uses the legacy strike count).", minimum=0, maximum=86400)
     presence_absent_strikes: int = _setting(
         2, P, "Legacy: consecutive absent checks before locking, used only when the "

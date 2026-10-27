@@ -93,11 +93,16 @@ class LockScreenPacer:
 
     # ---- request lifecycle -------------------------------------------------
 
-    def begin(self) -> Ticket:
+    def begin(self, selected: bool | None = None) -> Ticket:
+        """Start a request. ``selected``: the tile says you clicked it or pressed
+        Enter. Older tiles don't say; for them a request that arrives while
+        another is still waiting is taken as one (the tile restarts its request
+        when you select it).
+        """
         now = self._clock()
         with self._cond:
             session_started = now - self._last_request > SESSION_GAP_S and self._in_flight == 0
-            interactive = self._in_flight > 0
+            interactive = self._in_flight > 0 if selected is None else selected
             if not session_started:
                 # Time between requests, attributed to the mode in force before.
                 self._mode_time[self._last_mode] = (self._mode_time.get(self._last_mode, 0.0)

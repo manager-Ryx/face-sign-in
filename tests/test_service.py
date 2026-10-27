@@ -163,6 +163,53 @@ class ServiceTests(unittest.TestCase):
         os.utime(CREDS_PATH, (later, later))  # you saved the new password
         self.assertTrue(self.unlock([ME])["ok"])
 
+    def test_only_a_wrong_password_counts_as_rejected(self) -> None:
+        from face_service.config import CREDS_PATH
+        CREDS_PATH.write_bytes(b"stored")
+
+        def sign_in(status: int, substatus: int = 0) -> None:
+            attempt = self.unlock([ME])["attempt_id"]
+            self.service.handle({"cmd": "unlock_result", "attempt_id": attempt,
+                                 "accepted": False, "status": status,
+                                 "substatus": substatus}, SYSTEM)
+
+        for _ in range(3):  # a work laptop that can't reach its domain controller
+            sign_in(0xC000005E)
+        self.assertTrue(self.unlock([ME])["ok"])
+        for _ in range(2):
+            sign_in(0xC000006D, 0xC000006A)  # logon failure: wrong password
+        self.assertEqual(self.unlock([ME])["reason"], "password-rejected")
+
+    def test_windows_status_codes(self) -> None:
+        from face_service.service import password_rejected
+        self.assertTrue(password_rejected(False, None, None))  # older tiles say only "no"
+        self.assertTrue(password_rejected(False, 0xC000006D, 0xC000006A))
+        self.assertTrue(password_rejected(False, -1073741715, 0))  # LOGON_FAILURE, signed
+        self.assertTrue(password_rejected(False, 0xC0000071, 0))   # expired
+        self.assertFalse(password_rejected(False, 0xC000005E, 0))  # no logon servers
+        self.assertFalse(password_rejected(False, 0xC0000234, 0))  # account locked out
+        self.assertFalse(password_rejected(False, 0xFFFFFFFF, 0))  # never reached Windows
+        self.assertFalse(password_rejected(True, 0, 0))
+
+    def test_missing_photo_protection_model_is_reported_not_taken_for_absence(self) -> None:
+        cfg = Config(threshold=0.45, anti_spoofing=True, unlock_client_check="log")
+        self.service.cfg = self.service.recognizer.cfg = cfg
+        self.service.recognizer.embedder.spoof_available = False
+        self.assertEqual(self.unlock([ME])["reason"], "anti-spoofing-unavailable")
+        self.service.camera.release_now()
+        self.service._unlock_priority_until = 0.0  # the sign-in screen has gone
+        ScriptedCamera.script = [ME]
+        presence = self.service.handle({"cmd": "presence"}, USER)
+        self.assertFalse(presence["ok"])
+        self.assertNotIn("present", presence)
+        self.assertIn("anti-spoofing-unavailable", self.service.status()["not_ready"])
+
+    def test_a_damaged_profile_does_not_stop_the_service(self) -> None:
+        EMBED_PATH.write_bytes(b"")  # cut short by a power loss
+        self.assertFalse(self.service.recognizer.load())
+        self.assertEqual(self.unlock([ME])["reason"], "not-enrolled")
+        self.assertTrue(EMBED_PATH.with_name(EMBED_PATH.stem + ".damaged.npz").exists())
+
     def test_missing_credentials(self) -> None:
         with patch("face_service.service.load_password", return_value=None):
             self.assertEqual(self.unlock([ME])["reason"], "no-credentials")
@@ -279,6 +326,25 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.unlock([ME])["reason"], "just-locked")
         self.watcher.emit("display-on")
         self.assertTrue(self.unlock([ME])["ok"])
+
+    def test_selecting_the_tile_after_your_own_lock_signs_you_in(self) -> None:
+        now = [5000.0]
+        self.service._clock = lambda: now[0]
+        self.watcher.emit("lock")
+        ScriptedCamera.script = [ME]
+        selected = {"cmd": "unlock", "selected": True}
+        # Straight after the lock, a selection is Windows preparing the sign-in screen.
+        self.assertEqual(self.service.handle(selected, SYSTEM)["reason"], "just-locked")
+        now[0] += 15
+        self.assertEqual(self.service.handle({"cmd": "unlock", "selected": False},
+                                             SYSTEM)["reason"], "just-locked")
+        self.assertTrue(self.service.handle(selected, SYSTEM)["ok"])
+
+    def test_a_refused_automatic_lock_is_not_mistaken_for_the_next_one(self) -> None:
+        self.service.handle({"cmd": "auto_lock", "away_s": 3600}, USER)
+        self.service.handle({"cmd": "auto_lock", "cancel": True}, USER)
+        self.watcher.emit("lock")  # a lock of your own
+        self.assertEqual(self.unlock([ME])["reason"], "just-locked")
 
     def test_an_automatic_lock_welcomes_you_back_at_once(self) -> None:
         self.service.handle({"cmd": "auto_lock", "away_s": 3600}, USER)

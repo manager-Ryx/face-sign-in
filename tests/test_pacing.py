@@ -116,6 +116,19 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(pacer.wait_turn(newer), "go")
         self.assertNotEqual(first.generation, newer.generation)
 
+    def test_a_tile_that_reports_selection_is_believed(self) -> None:
+        clock = Clock()
+        pacer = make(clock)
+        pacer.begin(False)
+        # Overlapping requests are a click only for tiles that don't say (older ones).
+        self.assertFalse(pacer.begin(False).interactive)
+        self.assertTrue(pacer.begin(None).interactive)
+        pacer.end(face_seen=False)
+        pacer.end(face_seen=False)
+        pacer.end(face_seen=False)
+        clock.now += 1
+        self.assertTrue(pacer.begin(True).interactive)
+
     def test_display_turning_on_wakes_a_waiting_request(self) -> None:
         display = ["off"]
         pacer = LockScreenPacer(idle_after_s=lambda: 60.0, idle_interval_s=lambda: 10.0,

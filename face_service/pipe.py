@@ -29,6 +29,7 @@ import winerror
 log = logging.getLogger(__name__)
 
 MAX_MESSAGE = 64 * 1024
+MAX_CLIENTS = 32   # connections served at once; more are closed straight away
 SYSTEM_SID = "S-1-5-18"
 _FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
 _PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
@@ -126,6 +127,7 @@ class PipeServer:
         self.read_timeout_s = read_timeout_s
         self.write_timeout_s = write_timeout_s
         self._stop = win32event.CreateEvent(None, True, False, None)
+        self._slots = threading.BoundedSemaphore(MAX_CLIENTS)
 
     def stop(self) -> None:
         win32event.SetEvent(self._stop)
@@ -181,8 +183,18 @@ class PipeServer:
                 if result != win32event.WAIT_OBJECT_0:
                     win32file.CancelIo(handle)
                     return False
-            threading.Thread(target=self._serve_client, args=(handle,), name="pipe-client",
-                             daemon=True).start()
+            if not self._slots.acquire(blocking=False):
+                # A flood of connections (or a stuck caller) must not grow threads forever.
+                log.warning("too many pipe connections at once; one was closed")
+                return True
+
+            def serve() -> None:
+                try:
+                    self._serve_client(handle)
+                finally:
+                    self._slots.release()
+
+            threading.Thread(target=serve, name="pipe-client", daemon=True).start()
             handed_off = True
             return True
         finally:

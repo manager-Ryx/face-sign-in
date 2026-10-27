@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QObject, QSize, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -117,6 +118,10 @@ def store_windows_password(user: str, domain: str, secret: str) -> tuple[bool, s
     return True, ""
 
 
+class _Result(QObject):
+    ready = Signal(object)
+
+
 class PasswordDialog(Dialog):
     """Store the Windows password used by face sign-in (DPAPI-encrypted)."""
 
@@ -161,9 +166,31 @@ class PasswordDialog(Dialog):
         if secret != again:
             self.banner.show_message("caution", "", "The two passwords don't match.")
             return
-        ok, problem = store_windows_password(self.user, self.domain, secret)
+        # Windows checks the password first, which can take a while on a work PC
+        # whose domain controller is out of reach: keep the window responsive.
+        self.accept_button.setEnabled(False)
+        self.banner.show_message("info", "", "Checking the password with Windows…")
+        result = _Result(self)
+        result.ready.connect(self._saved)
+        user, domain = self.user, self.domain
+
+        def run() -> None:
+            try:
+                outcome = store_windows_password(user, domain, secret)
+            except Exception as exc:  # noqa: BLE001
+                outcome = (False, str(exc))
+            try:
+                result.ready.emit(outcome)
+            except RuntimeError:
+                pass  # the window was closed meanwhile
+
+        threading.Thread(target=run, name="store-password", daemon=True).start()
         self.password.clear()
         self.repeat.clear()
+
+    def _saved(self, outcome: tuple[bool, str]) -> None:
+        ok, problem = outcome
+        self.accept_button.setEnabled(True)
         if not ok:
             self.banner.show_message("critical", "", problem)
             return

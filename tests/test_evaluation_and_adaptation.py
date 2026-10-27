@@ -21,6 +21,19 @@ def samples(distances, *, days: int = 6, lighting=("bright", "dim")) -> list[Gen
     return out
 
 
+class EvaluationStoreTests(unittest.TestCase):
+    def test_a_damaged_file_starts_fresh_instead_of_stopping_the_service(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from face_service.evaluation_store import EvaluationStore
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "evaluation.npz"
+            for damage in (b"", b"PK\x03\x04 cut short"):
+                path.write_bytes(damage)
+                self.assertEqual(len(EvaluationStore(path)), 0)
+
+
 class EvaluationTests(unittest.TestCase):
     def test_wilson_lower_bound_is_conservative(self) -> None:
         self.assertLess(wilson_lower(10, 10), 1.0)

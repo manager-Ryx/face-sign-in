@@ -56,12 +56,20 @@ class FakeEmbedder:
     def __init__(self, angles: dict[int, float] | None = None, faces: int = 1):
         self.angles = angles or {}
         self.faces = faces
+        self.spoof_available = True
+        self.spoof_error: str | None = None
 
     def load(self) -> None:
         pass
 
+    def load_spoof_model(self) -> bool:
+        self.spoof_error = None if self.spoof_available else "offline"
+        return self.spoof_available
+
     def detect(self, bgr, *, min_confidence: float, anti_spoofing: bool = False):
-        from face_service.embedder import DetectedFace
+        from face_service.embedder import DetectedFace, SpoofModelUnavailable
+        if anti_spoofing and not self.load_spoof_model():
+            raise SpoofModelUnavailable(self.spoof_error)
         key = int(bgr[0, 0, 0])
         if key not in self.angles or self.faces == 0:
             return []

@@ -579,8 +579,10 @@ class OnboardingWizard(QDialog):
 
     def _enroll(self) -> None:
         from .enroll import EnrollWizard
-        anchors = (self.status.get("profile") or {}).get("anchors", 0)
-        wizard = EnrollWizard(self.controller, "append" if anchors else "replace", self)
+        anchors = (self.status.get("profile") or {}).get("anchors") if self.status else None
+        # "Add" is safe without a profile too; only a known-empty profile starts afresh.
+        wizard = EnrollWizard(self.controller, "replace" if anchors == 0 else "append", self)
+        self.controller.capture_window_opened(wizard)  # hands the camera back on Windows+L
         wizard.exec()
         self.controller.client.refresh_status()
 
@@ -622,7 +624,8 @@ class OnboardingWizard(QDialog):
         lines = [
             "Face sign-in: " + ("on the lock screen" if tile and tile.installed else
                                 "not on the lock screen yet (see the Overview)"),
-            "Auto-lock: " + (f"after about {cfg.presence_absence_timeout_s // 60} minutes away"
+            "Auto-lock: " + (f"after about {cfg.effective_presence_absence_timeout_s // 60} "
+                             "minutes away"
                              if cfg.presence_enabled else "off"),
             "Learning your appearance: " + ("on" if cfg.adaptive_enrollment else "off"),
         ]
