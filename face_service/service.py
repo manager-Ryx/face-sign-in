@@ -15,7 +15,8 @@ Commands used by the tray app and tools:
   build_enrollment, profile_health, remove_anchors, map_anchor_files,
   learning_undo, learning_reset, threshold_apply, threshold_clear,
   snapshot_restore, camera_list, clear_measurements, low_light_reset, routine_reset,
-  auto_lock (the presence monitor is about to lock because you are away).
+  auto_lock (the presence monitor is about to lock because you are away),
+  calibrate_focus.
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ import shutil
 import statistics
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -57,13 +59,14 @@ from .detector import FaceDetector
 from .embedder import Embedder
 from .evaluation import evaluate_threshold
 from .evaluation_store import EvaluationStore
+from .exposure import calibrate_focus
 from .logs import setup_logging
 from .metrics import MetricsStore
 from .pacing import LockScreenPacer
 from .pipe import ClientInfo, PipeServer
-from .profile import SOURCE_ENROLLMENT, SOURCE_MANUAL
+from .profile import SOURCE_ENROLLMENT, SOURCE_MANUAL, SOURCE_PASSWORD, SOURCE_PRESENCE
 from .quality import assess, to_gray
-from .recognizer import IMAGE_SUFFIXES, NotEnrolledError, Outcome, Recognizer
+from .recognizer import IMAGE_SUFFIXES, FrameAnalysis, NotEnrolledError, Outcome, Recognizer
 from .routine import ReturnRoutine
 from .verification import Verdict, VerifyPolicy
 from .win_events import SessionWatcher
@@ -88,6 +91,11 @@ QUIET_REASONS = frozenset({"no_face", "superseded", "display-off", "stopped", "p
 PACING_REASONS = frozenset({"superseded", "display-off", "stopped", "starting"})
 QUIET_COMMANDS = frozenset({"ping", "status", "unlock"})  # unlock: one summary per lock instead
 AUTO_LOCK_NOTICE_S = 10.0   # a lock this soon after the presence monitor's notice is its own
+# After a password or PIN sign-in: learn from what the sign-in screen saw just before.
+PASSWORD_LOOKBACK_S = 120.0
+PASSWORD_SAMPLES = 3
+PASSWORD_ANCHOR_SLACK = 0.15   # may be this much further from your photos than a match
+PRESENCE_LEARN_GAP_S = 600.0   # at most one view learned while you sit, per ten minutes
 CAUGHT_TEXT = {"instant": "by face straight away", "quick-look": "by face on a quick look",
                "other": "another way"}
 
@@ -106,6 +114,8 @@ class _LockSession:
     inferred: bool = False          # the service started while the screen was already locked
     automatic: bool = False         # locked by the presence monitor because you were away
     armed: bool = True              # face sign-in allowed (after a manual lock: once you left)
+    # Views of a face during this lock (memory only), for learning if you then use a password.
+    recent: deque[tuple[float, FrameAnalysis]] = field(default_factory=lambda: deque(maxlen=60))
     face_seen: bool = False
     face_accepted: bool = False
     attempts: int = 0
@@ -154,6 +164,7 @@ class FaceService:
         self._session_lock = threading.Lock()
         self._auto_lock_notice: tuple[float, float] | None = None  # (when, seconds away)
         self._face_sign_in_at: float | None = None                 # wall clock
+        self._presence_learned_at = float("-inf")
         self._caller_seen: tuple[str | None, bool] | None = None
         self._device_status: tuple[float, dict] | None = None
         self._ready_reason = "starting"
@@ -228,6 +239,8 @@ class FaceService:
             top_reason=max(session.reasons, key=session.reasons.get) if session.reasons else "")
         log.info("lock screen: away %.0f min, %d look(s), signed in %s", away_s / 60.0,
                  session.attempts, CAUGHT_TEXT[caught])
+        if not session.face_accepted:
+            self._learn_after_password(session)
         if self.cfg.unlock_learn_routine and not session.inferred:
             known = self.routine.schedule() is not None
             self.routine.observe(session.started_wall, self._wall_clock())
@@ -257,6 +270,52 @@ class FaceService:
                 if reason == "match" and session.accepted_at is None:
                     session.accepted_at = self._clock()
                     session.accepted_mode = mode
+
+    def _keep_for_learning(self, verdict: Verdict) -> None:
+        """Remember this lock's views of a face, in case you then sign in another way."""
+        views = [f for f in verdict.frames if f.embedding is not None and f.face_count == 1]
+        if not views:
+            return
+        now = self._wall_clock()
+        with self._session_lock:
+            if self._lock_session is not None:
+                self._lock_session.recent.extend((now, view) for view in views)
+
+    def _learn_after_password(self, session: _LockSession) -> None:
+        """You signed in with your password or PIN, so the face the sign-in screen saw
+        just before was you, even though it couldn't recognise you (say, a bright window
+        behind you). Learn a few distinct views of it."""
+        cfg = self.cfg
+        if not (cfg.adaptive_enrollment and cfg.adaptive_learn_after_password) or session.inferred:
+            return
+        cutoff = self._wall_clock() - PASSWORD_LOOKBACK_S
+        views = [view for at, view in session.recent if at >= cutoff]
+        if not views:
+            return
+        result = self.recognizer.learn_now(
+            views, source=SOURCE_PASSWORD, limit=PASSWORD_SAMPLES,
+            max_anchor_distance=self.threshold + PASSWORD_ANCHOR_SLACK, poor_light=True)
+        log.info("after a sign-in without your face: learned %d view(s) (%s)", result.added,
+                 result.reason)
+        if result.added:
+            self.adaptation.note("learning", None, f"{result.added} view(s)",
+                                 "Learned how you looked on the sign-in screen before you used "
+                                 "your password", by="automatic")
+
+    def _learn_while_present(self, verdict: Verdict) -> None:
+        """While you sit here, fill in times of day that have no learned view yet."""
+        cfg = self.cfg
+        now = self._wall_clock()
+        if (not (cfg.adaptive_enrollment and cfg.adaptive_learn_while_present)
+                or now - self._presence_learned_at < PRESENCE_LEARN_GAP_S
+                or self.recognizer.slot_recently_learned(now)):
+            return
+        views = [f for f in verdict.frames if f.match and f.embedding is not None]
+        result = self.recognizer.learn_now(views, source=SOURCE_PRESENCE, limit=1,
+                                           max_anchor_distance=self.threshold)
+        if result.added:
+            self._presence_learned_at = now
+            log.info("learned a view of you for this time of day")
 
     def _ensure_lock_session(self) -> None:
         """Time the rest of a lock that began before the service started."""
@@ -442,6 +501,11 @@ class FaceService:
             if mode == "idle":
                 # A quick look: one frame; a full attempt only if someone is there.
                 policy = replace(policy, max_no_face=1)
+            if ticket.interactive:
+                # You selected the tile: look longer and at more frames (never more loosely).
+                policy = replace(policy, max_frames=max(policy.max_frames, 8),
+                                 max_no_face=max(policy.max_no_face, 5),
+                                 time_budget_s=max(policy.time_budget_s, 6.0))
             looked_at = self._clock()
             with self.camera.session("unlock", wait_s=8.0) as session:
                 session_ref = session
@@ -450,6 +514,7 @@ class FaceService:
                 face_seen = any(f.outcome is not Outcome.NO_FACE for f in verdict.frames)
                 session.release_after = (0.0 if verdict.accepted or mode != "active"
                                          else self.camera.hold_seconds())
+            self._keep_for_learning(verdict)
             armed = self._armed_after_look(face_seen, ticket.interactive)
             reason = verdict.reason
             if not verdict.accepted:
@@ -564,6 +629,8 @@ class FaceService:
                 self._record_attempt("presence_check", verdict, reason=verdict.reason,
                                      session=session)
                 self._trial_low_light(session, verdict)
+            if verdict.accepted:
+                self._learn_while_present(verdict)
         except NotEnrolledError:
             return {"ok": False, "reason": "not-enrolled"}
         except CameraUnavailable as exc:
@@ -624,6 +691,7 @@ class FaceService:
     def build_enrollment(self, request: dict) -> dict:
         mode = request.get("mode", "replace")
         dry_run = bool(request.get("dry_run", False))
+        poor_light = request.get("allow_poor_light") is True  # you chose to keep such photos
         staging = request.get("staging")
         if staging:
             folder = self._staging_dir(staging)
@@ -638,7 +706,8 @@ class FaceService:
         holdout = 0 if dry_run or not staging else 7
         try:
             report = self.recognizer.build_profile(photos, mode=mode, source=source,
-                                                   dry_run=dry_run, holdout_every=holdout)
+                                                   dry_run=dry_run, holdout_every=holdout,
+                                                   allow_poor_light=poor_light)
         except ValueError as exc:
             return {"ok": False, "reason": "no-usable-face", "message": str(exc)}
         if not dry_run and staging:
@@ -771,6 +840,7 @@ class FaceService:
             "low_light_reset": lambda r, c: self._low_light_reset(),
             "routine_reset": lambda r, c: self._routine_reset(),
             "auto_lock": lambda r, c: self._expect_auto_lock(r.get("away_s")),
+            "calibrate_focus": lambda r, c: self._calibrate_focus(),
         }
 
     def _legacy_verify(self) -> dict:
@@ -897,6 +967,21 @@ class FaceService:
                              "You asked the app to re-measure camera behaviour", by="you")
         return {"ok": True}
 
+    def _calibrate_focus(self) -> dict:
+        """Sweep the lens while you sit as usual; the app saves the sharpest position."""
+        try:
+            with self.camera.session("check", wait_s=5.0) as session:
+                result = calibrate_focus(session.camera, self.detector)
+        except CameraUnavailable as exc:
+            return {"ok": False, "reason": exc.reason, "message": str(exc)}
+        except CameraError as exc:
+            return {"ok": False, "reason": f"camera-{exc.kind}", "message": str(exc)}
+        if result.best is None:
+            return {"ok": False, "reason": "no-face",
+                    "message": "Your face wasn't clear enough to judge the focus. Sit as you "
+                               "normally do, facing the camera, and try again."}
+        return {"ok": True, "position": result.best, "positions": result.faces_seen}
+
     def _expect_auto_lock(self, away_s: Any) -> dict:
         """The presence monitor is about to lock because you are away: the next lock
         is not yours, so face sign-in may welcome you back straight away."""
@@ -924,7 +1009,9 @@ class FaceService:
         self.config_problems = result.problems
         if (old.camera_device_id != self.cfg.camera_device_id
                 or old.camera_index != self.cfg.camera_index
-                or old.persistent_camera != self.cfg.persistent_camera):
+                or old.persistent_camera != self.cfg.persistent_camera
+                or old.camera_focus != self.cfg.camera_focus
+                or old.camera_face_exposure != self.cfg.camera_face_exposure):
             self.camera.release_now()
             self._device_status = None
         log.info("configuration reloaded (%d problem(s))", len(result.problems))

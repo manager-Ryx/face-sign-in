@@ -121,6 +121,12 @@ class Config:
         "(0 disables).", minimum=0.0, maximum=30.0)
     persistent_camera: bool = _setting(
         False, P, "Keep the camera open all the time (camera light stays on).")
+    camera_face_exposure: bool = _setting(
+        True, P, "Adjust the camera's brightness so your face is well lit, for example with a "
+        "bright window behind you. Undone whenever the camera is released.")
+    camera_focus: int = _setting(
+        0, P, "Fixed focus position for your desk (0 uses the camera's automatic focus). "
+        "Set it with \"Set focus for my desk\".", minimum=0, maximum=1023)
     unlock_camera_hold_s: float = _setting(
         15.0, A, "Longest time the camera stays open between active lock-screen retries.",
         minimum=0.0, maximum=30.0)
@@ -164,6 +170,13 @@ class Config:
     # --- learning ----------------------------------------------------------
     adaptive_enrollment: bool = _setting(
         False, P, "Learn your current appearance from confirmed face sign-ins.")
+    adaptive_learn_after_password: bool = _setting(
+        True, P, "When face sign-in failed and you used your password or PIN, learn from the "
+        "views the sign-in screen saw just before (poor light allowed; they must still be close "
+        "to your original photos).")
+    adaptive_learn_while_present: bool = _setting(
+        True, P, "While you are at the PC, learn one view at times of day not covered yet "
+        "(at most one every 10 minutes), so every kind of daylight is represented.")
     adaptive_samples_per_unlock: int = _setting(
         1, S, "Most face samples learned from one confirmed sign-in.", minimum=0, maximum=2)
     adaptive_max_embeddings: int = _setting(

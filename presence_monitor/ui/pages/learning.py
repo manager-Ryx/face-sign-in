@@ -25,6 +25,7 @@ from ..widgets import (
 if TYPE_CHECKING:
     from ...app import AppController
 
+HOW_LEARNED = {3: " · after your password", 4: " · while you were here"}
 LIGHT = {"bright": "good light", "dim": "dim light", "dark": "darkness", "backlit": "backlight",
          "unknown": "unknown light"}
 
@@ -142,9 +143,29 @@ class LearningPage(Page):
             lambda on: self._set(adaptive_enrollment=on))
         learn.body.addWidget(SettingRow(G.BULB, "Learn from successful face sign-ins",
                                         "After Windows confirms a face sign-in, keep the single "
-                                        "most useful new view of your face. Failed attempts and "
-                                        "routine presence checks are never learned from.",
+                                        "most useful new view of your face. A failed attempt is "
+                                        "only learned from if you then sign in with your "
+                                        "password (below).",
                                         self.learn_toggle))
+        self.password_toggle = ToggleSwitch()
+        self.password_toggle.toggled.connect(
+            lambda on: self._set(adaptive_learn_after_password=on))
+        self.password_row = SettingRow(
+            G.KEY, "Also learn when I sign in with my password",
+            "If face sign-in didn't recognise you and you used your password or PIN, keep up to "
+            "three views the sign-in screen saw just before. Poor light is fine; they must still "
+            "look like your original photos, so nobody else is ever learned.",
+            self.password_toggle)
+        learn.body.addWidget(self.password_row)
+        self.present_toggle = ToggleSwitch()
+        self.present_toggle.toggled.connect(
+            lambda on: self._set(adaptive_learn_while_present=on))
+        self.present_row = SettingRow(
+            G.CLOCK, "Learn at different times of day while I'm here",
+            "While you're at the PC, keep a view for each ten minutes of the day that isn't "
+            "covered yet (at most one every 10 minutes), so morning sun and evening light are "
+            "both known.", self.present_toggle)
+        learn.body.addWidget(self.present_row)
         learn.body.addWidget(self._divider())
         body = QWidget()
         body.setObjectName("Transparent")
@@ -319,7 +340,11 @@ class LearningPage(Page):
 
     def refresh(self) -> None:
         cfg = self.controller.cfg
+        self.password_row.setEnabled(cfg.adaptive_enrollment)
+        self.present_row.setEnabled(cfg.adaptive_enrollment)
         for toggle, value in ((self.learn_toggle, cfg.adaptive_enrollment),
+                              (self.password_toggle, cfg.adaptive_learn_after_password),
+                              (self.present_toggle, cfg.adaptive_learn_while_present),
                               (self.routine_toggle, cfg.unlock_learn_routine),
                               (self.auto_toggle, cfg.auto_tighten_threshold),
                               (self.away_toggle, cfg.absence_learning),
@@ -373,7 +398,9 @@ class LearningPage(Page):
             "most redundant go first, and the newest are always kept).")
         _clear(self.timeline)
         for item in info.get("timeline", [])[:8]:
-            text = (f"{sentence(when(item['at']))} · learned in {LIGHT.get(item['lighting'], '')}"
+            how = HOW_LEARNED.get(item.get("source"), "")
+            text = (f"{sentence(when(item['at']))}{how} · learned in "
+                    f"{LIGHT.get(item['lighting'], '')}"
                     f" · image quality {item['quality']:.2f}")
             self.timeline.addLayout(hbox(GlyphLabel(G.ADD, 14, tone="accent"),
                                          label(text, "Secondary"), spacing=6))

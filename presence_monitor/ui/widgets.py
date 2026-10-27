@@ -213,8 +213,10 @@ class SettingRow(QWidget):
         self.title = label(title, "Body")
         self.description = label(description, "Secondary", wrap=True)
         text.addWidget(self.title)
-        if description:
-            text.addWidget(self.description)
+        # Always part of the row (hidden while empty): a description set later must
+        # appear here, not as a stray top-level window.
+        text.addWidget(self.description)
+        self.description.setVisible(bool(description))
         layout.addLayout(text, 1)
         self.control_box = QHBoxLayout()
         self.control_box.setSpacing(10)

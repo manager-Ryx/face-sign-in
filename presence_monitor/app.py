@@ -50,6 +50,7 @@ from .ui.client import ServiceClient
 log = logging.getLogger(__name__)
 
 INSTANCE_KEY = f"FaceUnlockTray-{os.environ.get('USERNAME', 'user')}"
+APP_USER_MODEL_ID = "FaceUnlock.App"
 
 
 class AppController(QObject):
@@ -260,8 +261,20 @@ def _activate_existing() -> bool:
     return False
 
 
+def _set_app_id() -> None:
+    """Show Face Unlock's own icon in the taskbar rather than Python's.
+
+    Without an explicit app ID, Windows groups the windows under pythonw.exe
+    and uses its icon."""
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except (AttributeError, OSError):
+        log.debug("could not set the taskbar app ID")
+
+
 def main() -> None:
     setup_logging(PRESENCE_LOG_PATH, console=False)
+    _set_app_id()
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)

@@ -139,6 +139,56 @@ class CapturePlanTests(unittest.TestCase):
         self.assertEqual(plan.taken, plan.total)
 
 
+class CaptureFailSafeTests(unittest.TestCase):
+    def straight_on_done(self) -> CapturePlan:
+        plan = CapturePlan({"center": 2, "left": 0, "right": 0, "up": 0, "down": 1})
+        plan.take_anyway(box(320), now=0)
+        plan.take_anyway(box(320), now=1)
+        return plan
+
+    def test_take_photo_now_counts_for_the_angle_asked_for(self) -> None:
+        plan = self.straight_on_done()
+        self.assertEqual(plan.next_pose(), "down")
+        self.assertEqual(plan.take_anyway(box(320), now=2), "down")
+        self.assertTrue(plan.done)
+        self.assertEqual(plan.manual, 3)
+
+    def test_an_angle_can_be_skipped_but_not_straight_on(self) -> None:
+        plan = CapturePlan({"center": 2, "left": 0, "right": 0, "up": 0, "down": 1})
+        self.assertIsNone(plan.skip())
+        plan = self.straight_on_done()
+        self.assertEqual(plan.skip(), "down")
+        self.assertTrue(plan.done)
+
+    def test_a_smaller_tilt_is_enough_after_being_stuck(self) -> None:
+        plan = self.straight_on_done()
+        slight = box(320, 305)  # less chin-down than normally needed
+        self.assertNotEqual(plan.observe(textured(120), [slight], now=2).pose, "down")
+        late = plan.observe(textured(120), [slight], now=11)
+        self.assertTrue(late.stuck)
+        self.assertEqual(late.pose, "down")
+
+
+class SettingRowTests(unittest.TestCase):
+    def test_a_description_set_later_appears_inside_the_row(self) -> None:
+        from presence_monitor.ui.widgets import SettingRow
+        row = SettingRow(None, "Focus")
+        row.set_description("Automatic.")
+        self.assertIs(row.description.window(), row.window())
+        self.assertFalse(row.description.isWindow())
+
+
+class SetupWizardTests(unittest.TestCase):
+    def test_cancel_closes_the_setup_window(self) -> None:
+        from presence_monitor.ui.enroll import EnrollWizard
+        wizard = EnrollWizard(DemoController(APP, "light"), "append", None)  # type: ignore[arg-type]
+        wizard.show()
+        APP.processEvents()
+        wizard.cancel.click()
+        APP.processEvents()
+        self.assertFalse(wizard.isVisible())
+
+
 class RoutineTextTests(unittest.TestCase):
     def test_learned_routine_in_plain_english(self) -> None:
         from presence_monitor.ui.pages.learning import describe_routine, routine_outcome

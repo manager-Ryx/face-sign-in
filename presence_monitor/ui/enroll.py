@@ -32,12 +32,22 @@ from PySide6.QtWidgets import (
 from face_service.camera import Camera, CameraError
 from face_service.config import APP_DIR
 from face_service.detector import FaceDetector
+from face_service.exposure import expose_for_face
 from face_service.quality import to_gray
 
 from . import theme
 from .capture import CapturePlan, Observation, targets_for
 from .icons import G, GlyphLabel
-from .widgets import Banner, Card, ProgressRing, accent_button, button, hbox, label
+from .widgets import (
+    Banner,
+    Card,
+    ProgressRing,
+    accent_button,
+    button,
+    hbox,
+    label,
+    subtle_button,
+)
 
 if TYPE_CHECKING:
     from ..app import AppController
@@ -48,23 +58,35 @@ OWNER = "enrollment"
 LEASE_S = 120
 RENEW_MS = 30_000
 PREVIEW_FPS = 20
+EXPOSE_EVERY_S = 1.0     # how often the face's brightness is re-checked while capturing
 
 
 class CaptureWorker(QThread):
     preview = Signal(QImage, object)     # mirrored image, Observation
     captured = Signal(int, int)          # taken, total
     failed = Signal(str)
+    notice = Signal(str)
 
     def __init__(self, controller: AppController, staging: Path, plan: CapturePlan):
         super().__init__()
         self.cfg = controller.cfg
         self.staging = staging
         self.plan = plan
+        # Requests from the window, handled on this thread (the plan is only touched here).
+        self.take_requested = False
+        self.skip_requested = False
+
+    def _save(self, frame, pose: str, suffix: str = "") -> bool:
+        index = self.plan.taken + 1
+        path = self.staging / f"face-{index:02d}-{pose}{suffix}.jpg"
+        return cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
     def run(self) -> None:
         camera = Camera.from_config(self.cfg, allow_slow_backend=True, open_budget_s=20.0)
         try:
             report = camera.open()
+            if self.cfg.camera_focus:
+                camera.fix_focus(self.cfg.camera_focus)
             camera.settle()
         except CameraError as exc:
             log.warning("setup could not start the camera: %s", exc)
@@ -73,16 +95,30 @@ class CaptureWorker(QThread):
             return
         log.info("setup camera started in %.0f ms", report.open_ms)
         detector = FaceDetector()
-        last_emit = 0.0
+        last_emit = last_exposed = 0.0
         try:
             while not self.isInterruptionRequested() and not self.plan.done:
                 frame = camera.read_frame()
+                if self.cfg.camera_face_exposure and time.monotonic() - last_exposed >= EXPOSE_EVERY_S:
+                    last_exposed = time.monotonic()
+                    frame = expose_for_face(camera, frame, detector).frame
                 faces = detector.detect(frame)
                 observation = self.plan.observe(to_gray(frame), faces)
-                if observation.capture and observation.pose and observation.box:
-                    index = self.plan.taken + 1
-                    path = self.staging / f"face-{index:02d}-{observation.pose}.jpg"
-                    if cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+                if self.skip_requested:
+                    self.skip_requested = False
+                    if self.plan.skip():
+                        self.captured.emit(self.plan.taken, self.plan.total)
+                if self.take_requested:
+                    self.take_requested = False
+                    box = faces[0] if len(faces) == 1 else None
+                    pose = self.plan.next_pose()
+                    if box is None or pose is None:
+                        self.notice.emit("Make sure your face, and only yours, is in view.")
+                    elif self._save(frame, pose, "-manual"):
+                        self.plan.take_anyway(box)
+                        self.captured.emit(self.plan.taken, self.plan.total)
+                elif observation.capture and observation.pose and observation.box:
+                    if self._save(frame, observation.pose):
                         self.plan.record(observation.pose, observation.box)
                         self.captured.emit(self.plan.taken, self.plan.total)
                 now = time.monotonic()
@@ -217,7 +253,7 @@ class EnrollWizard(QDialog):
         outer.addLayout(self.buttons)
         self.primary = accent_button("", self._primary)
         self.secondary = button("", self._secondary)
-        self.cancel = button("Cancel", self.close)
+        self.cancel = button("Cancel", self.reject)
         self.buttons.addStretch(1)
         self.buttons.addWidget(self.secondary)
         self.buttons.addWidget(self.primary)
@@ -274,6 +310,12 @@ class EnrollWizard(QDialog):
         self.progress_text = label("", "Secondary")
         layout.addLayout(hbox(self.guidance, self.progress_text, spacing=12, stretch_at=1))
         layout.addWidget(self.progress)
+        # Fail-safes for when the automatic capture won't trigger.
+        self.take_button = button("Take photo now", self._take_now)
+        self.take_button.setToolTip("Use this view for the angle being asked for, even in poor "
+                                    "light.")
+        self.skip_button = subtle_button("Skip this angle", self._skip_angle)
+        layout.addLayout(hbox(self.take_button, self.skip_button, stretch_at=2))
         return page
 
     def _review_page(self) -> QWidget:
@@ -368,6 +410,7 @@ class EnrollWizard(QDialog):
             self.worker.preview.connect(self._on_preview)
             self.worker.captured.connect(self._update_progress)
             self.worker.failed.connect(self._on_failed)
+            self.worker.notice.connect(self.guidance.setText)
             self.worker.finished.connect(self._on_worker_finished)
             self.worker.start()
 
@@ -386,7 +429,22 @@ class EnrollWizard(QDialog):
 
     def _on_preview(self, image: QImage, observation: Observation) -> None:
         self.preview.show_frame(image, observation)
-        self.guidance.setText(observation.guidance)
+        text = observation.guidance
+        if observation.box is not None and (observation.stuck or observation.tone == "issue"):
+            text += (" Or press “Take photo now” to use this view anyway"
+                     + (", or skip this angle." if observation.wanted not in (None, "center")
+                        else "."))
+        self.guidance.setText(text)
+        self.take_button.setEnabled(observation.box is not None)
+        self.skip_button.setEnabled(observation.wanted not in (None, "center"))
+
+    def _take_now(self) -> None:
+        if self.worker is not None:
+            self.worker.take_requested = True
+
+    def _skip_angle(self) -> None:
+        if self.worker is not None:
+            self.worker.skip_requested = True
 
     def _update_progress(self, taken: int, total: int) -> None:
         self.progress.setMaximum(total)
@@ -461,7 +519,8 @@ class EnrollWizard(QDialog):
 
         self.controller.client.request(
             {"cmd": "build_enrollment", "mode": self.mode, "staging": self.staging.name,
-             "dry_run": True}, checked, timeout_s=120.0)
+             "dry_run": True, "allow_poor_light": self._poor_light_ok()}, checked,
+            timeout_s=120.0)
 
     def _save(self) -> None:
         self.primary.setEnabled(False)
@@ -487,8 +546,12 @@ class EnrollWizard(QDialog):
             self.controller.client.refresh_status()
 
         self.controller.client.request(
-            {"cmd": "build_enrollment", "mode": self.mode, "staging": self.staging.name},
-            saved, timeout_s=120.0)
+            {"cmd": "build_enrollment", "mode": self.mode, "staging": self.staging.name,
+             "allow_poor_light": self._poor_light_ok()}, saved, timeout_s=120.0)
+
+    def _poor_light_ok(self) -> bool:
+        """Photos you took yourself are kept even in poor light: you chose them."""
+        return self.plan is not None and self.plan.manual > 0
 
     def _discard_staging(self) -> None:
         if self.staging is not None:
@@ -496,17 +559,18 @@ class EnrollWizard(QDialog):
             self.staging = None
         self.plan = None
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+    def reject(self) -> None:
+        """Cancel, Close, Esc and the window's close button all end here.
+
+        (Qt's dialog close handling calls ``reject``; this used to call
+        ``close`` again, so Qt refused the close and Cancel did nothing.)
+        """
         index = self.stack.currentIndex()
         if index in (1, 2) and self.plan is not None and self.plan.taken:
             from .dialogs import confirm
             if not confirm(self, "Stop setting up?", "The photos taken so far are discarded and "
                            "your current profile stays as it is.", "Stop"):
-                event.ignore()
                 return
         self._stop_camera()
         self._discard_staging()
-        super().closeEvent(event)
-
-    def reject(self) -> None:
-        self.close()
+        super().reject()

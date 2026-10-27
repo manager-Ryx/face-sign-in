@@ -26,8 +26,13 @@ when you walk away. Everything runs locally; nothing is uploaded.
   you have been away for the time you chose (one hour by default) Windows
   locks. Apps keep running. Checks pause while Windows is already locked.
 - **Keeps up with you.** After Windows *confirms* a face sign-in, the single
-  most useful new view of your face can be added to your profile – within
-  strict limits, explained and undoable on the *Learning* page.
+  most useful new view of your face can be added to your profile. If it failed
+  and you used your password, it learns the views it missed; while you sit at
+  the PC it fills in times of day it hasn't seen. All within strict limits,
+  explained and undoable on the *Learning* page.
+- **Copes with a bright window behind you.** It raises the camera's
+  brightness for your face (and puts it back afterwards), and can hold a
+  fixed focus for your desk.
 - **A Windows 11 style app** (Qt) with an overview, a guided face setup with a
   live preview, a recognition test, plain-English settings, and a *Learning
   and adaptation* page that shows what was learned, measured and changed.

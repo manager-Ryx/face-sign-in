@@ -20,10 +20,13 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 
 from .camera import Camera, CameraError, CameraMovedError, SettleReport, describe_error, find_camera
 from .camera_profile import CameraProfile
 from .config import Config
+from .detector import FaceDetector
+from .exposure import FACE_HIGH, FACE_LOW, expose_for_face
 from .metrics import MetricsStore
 
 log = logging.getLogger(__name__)
@@ -101,6 +104,7 @@ class CameraManager:
         self._last_unlock_sample = -UNLOCK_START_SAMPLE_S
         self._opened_for = ""
         self._opened_at = 0.0
+        self._detector: FaceDetector | None = None
 
     # ---- status ------------------------------------------------------------
 
@@ -293,6 +297,8 @@ class CameraManager:
                 raise
             self._camera = camera
             open_ms = report.open_ms
+            if cfg.camera_focus and hasattr(camera, "fix_focus")                     and not camera.fix_focus(cfg.camera_focus):
+                log.warning("the camera did not accept focus position %d", cfg.camera_focus)
         else:
             camera = self._camera
             open_ms = 0.0
@@ -306,6 +312,7 @@ class CameraManager:
             self._close_camera()
             self._fail(exc, purpose)
             raise
+        settle = self._expose_for_face(camera, settle, purpose)
         if not reused:
             self._opened_for, self._opened_at = purpose, self._clock()
             self.profile.observe_start(lighting, fps=camera.fps, open_ms=open_ms,
@@ -328,6 +335,28 @@ class CameraManager:
             if not reused:
                 self._last_open_ms = round(open_ms, 1)
         return CameraSession(self, camera, purpose, settle, lighting)
+
+    def _expose_for_face(self, camera: Camera, settle: SettleReport,
+                         purpose: str) -> SettleReport:
+        """With a badly lit face in view (a bright window behind you), raise or lower
+        brightness for this capture; what worked is remembered per kind of light."""
+        if not self.cfg().camera_face_exposure or not hasattr(camera, "set_control"):
+            return settle
+        if self._detector is None:
+            self._detector = FaceDetector()
+        result = expose_for_face(camera, settle.frame, self._detector,
+                                 start_offset=self.profile.face_offset)
+        if (result.lighting and result.face_after is not None
+                and FACE_LOW <= result.face_after <= FACE_HIGH):
+            self.profile.observe_face_offset(result.lighting, result.offset)
+        if not result.adjusted:
+            return settle
+        log.info("face exposure for %s: brightness %+.0f, face %.0f -> %.0f (%s)", purpose,
+                 result.offset, result.face_before, result.face_after, result.lighting)
+        self.metrics.record("face_exposure", purpose=purpose, offset=result.offset,
+                            before=result.face_before, after=result.face_after,
+                            steps=result.steps, lighting=result.lighting)
+        return replace(settle, frame=result.frame)
 
     def _fail(self, exc: CameraError, purpose: str) -> None:
         with self._state:

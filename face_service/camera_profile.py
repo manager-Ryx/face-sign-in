@@ -53,7 +53,7 @@ class CameraProfile:
     # ---- persistence -------------------------------------------------------
 
     def _empty(self) -> dict[str, Any]:
-        return {"version": 1, "buckets": {}, "hours": {}, "last": None,
+        return {"version": 1, "buckets": {}, "hours": {}, "last": None, "face_offset": {},
                 "low_light": {"state": "trial", "gains": [], "switch_ms": None,
                               "reason": "Not measured yet"}}
 
@@ -142,7 +142,21 @@ class CameraProfile:
                                      f"{median:.2f}x in {len(gains)} trials")
             self._save()
 
+    def observe_face_offset(self, lighting: str, offset: float) -> None:
+        """The brightness offset that left your face well lit in this light."""
+        if lighting not in LIGHTING or not math.isfinite(offset):
+            return
+        with self._lock:
+            offsets = self._data.setdefault("face_offset", {})
+            offsets[lighting] = round(_ewma(offsets.get(lighting), offset), 1)
+            self._changed()
+
     # ---- predictions -------------------------------------------------------
+
+    def face_offset(self, lighting: str) -> float | None:
+        with self._lock:
+            value = (self._data.get("face_offset") or {}).get(lighting)
+        return float(value) if isinstance(value, (int, float)) else None
 
     def predict_lighting(self) -> str:
         now = self._clock()

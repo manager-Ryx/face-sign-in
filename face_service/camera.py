@@ -11,6 +11,11 @@ Camera).
 Measured on the NearStream V02AF: the driver already delivers 640x480 at
 30 fps, and re-setting width/height after opening rebuilt the DirectShow
 graph and cost about 1.1 s per open, so the capture is used as delivered.
+
+Camera controls (brightness, focus) may be changed for one capture only:
+the original values are put back when it closes. A small marker file records
+what was changed, so even a crash cannot leave the camera altered for other
+apps; the next capture to open restores it.
 """
 from __future__ import annotations
 
@@ -23,7 +28,12 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from .config import STATE_DIR
+from .storage import read_state, write_json_atomic
+
 log = logging.getLogger(__name__)
+
+CONTROLS_MARKER = STATE_DIR / "camera_controls.json"
 
 TARGET_SIZE = (640, 480)
 _HARDWARE_RE = re.compile(r"vid_[0-9a-f]{4}&pid_[0-9a-f]{4}(?:&mi_[0-9a-f]{2})?")
@@ -182,6 +192,7 @@ class Camera:
         self._cap: cv2.VideoCapture | None = None
         self._report: OpenReport | None = None
         self._read_failures = 0
+        self._originals: dict[int, float] = {}
 
     @classmethod
     def from_config(cls, cfg, *, fps: float | None = None, **kwargs) -> Camera:
@@ -240,6 +251,7 @@ class Camera:
                         height, width = frame.shape[:2]
                 self._cap = cap
                 self._read_failures = 0
+                _undo_leftover_changes(cap)
                 self._report = OpenReport(index, backend,
                                           (time.perf_counter() - started) * 1000.0,
                                           self.fps, (width, height))
@@ -309,7 +321,47 @@ class Camera:
         return SettleReport(len(trace), (time.perf_counter() - started) * 1000.0, False,
                             reason, [round(v, 1) for v in trace[-8:]], frame)
 
+    # ---- controls ------------------------------------------------------------
+
+    def control(self, prop: int) -> float | None:
+        """Current value of a camera control, or ``None`` if the driver lacks it."""
+        if self._cap is None:
+            return None
+        value = float(self._cap.get(prop))
+        return None if value == -1.0 else value
+
+    def original(self, prop: int) -> float | None:
+        """The control's value before this capture changed it."""
+        return self._originals.get(prop, self.control(prop))
+
+    def set_control(self, prop: int, value: float) -> bool:
+        """Change a control for this capture only; ``close()`` puts it back."""
+        if self._cap is None:
+            return False
+        if prop not in self._originals:
+            current = self.control(prop)
+            if current is None:
+                return False
+            self._originals[prop] = current
+            _write_marker(self._originals)
+        return bool(self._cap.set(prop, float(value)))
+
+    def fix_focus(self, position: int) -> bool:
+        """Turn autofocus off and hold the lens at ``position``."""
+        return (self.set_control(cv2.CAP_PROP_AUTOFOCUS, 0)
+                and self.set_control(cv2.CAP_PROP_FOCUS, position)
+                and self.control(cv2.CAP_PROP_FOCUS) == position)
+
+    def restore_controls(self) -> None:
+        if self._cap is not None:
+            for prop, value in reversed(list(self._originals.items())):
+                self._cap.set(prop, value)
+        if self._originals:
+            self._originals.clear()
+            _clear_marker()
+
     def close(self) -> None:
+        self.restore_controls()
         cap, self._cap = self._cap, None
         self._report = None
         if cap is not None:
@@ -321,6 +373,37 @@ class Camera:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+def _write_marker(originals: dict[int, float]) -> None:
+    try:
+        write_json_atomic(CONTROLS_MARKER, {"version": 1, "controls": {
+            str(prop): value for prop, value in originals.items()}})
+    except OSError as exc:
+        log.warning("camera control marker not saved: %s", exc)
+
+
+def _clear_marker() -> None:
+    try:
+        CONTROLS_MARKER.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("camera control marker not removed: %s", exc)
+
+
+def _undo_leftover_changes(cap: cv2.VideoCapture) -> None:
+    """Put back controls a capture changed but could not restore (it crashed)."""
+    if not CONTROLS_MARKER.exists():
+        return
+    controls = read_state(CONTROLS_MARKER, {"version": 1, "controls": {}},
+                          what="camera control marker")["controls"]
+    for prop, value in reversed(list(controls.items())):
+        try:
+            cap.set(int(prop), float(value))
+        except (TypeError, ValueError):
+            continue
+    if controls:
+        log.warning("restored camera controls left changed by an earlier capture")
+    _clear_marker()
 
 
 def describe_error(exc: BaseException) -> dict:

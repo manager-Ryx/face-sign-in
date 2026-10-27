@@ -32,8 +32,11 @@ PROFILE_VERSION = 4
 SOURCE_ENROLLMENT = 0
 SOURCE_UNLOCK = 1
 SOURCE_MANUAL = 2
+SOURCE_PASSWORD = 3   # seen on the sign-in screen just before a password or PIN sign-in
+SOURCE_PRESENCE = 4   # seen while you were at the PC
 SOURCE_NAMES = {SOURCE_ENROLLMENT: "enrollment", SOURCE_UNLOCK: "face sign-in",
-                SOURCE_MANUAL: "added by you"}
+                SOURCE_MANUAL: "added by you", SOURCE_PASSWORD: "password sign-in",
+                SOURCE_PRESENCE: "while you were at the PC"}
 
 LIGHTING_CODES = ("unknown", "bright", "dim", "dark", "backlit")
 

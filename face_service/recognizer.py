@@ -46,10 +46,23 @@ from .quality import ImageQuality, assess, primary_issue, to_gray
 
 log = logging.getLogger(__name__)
 
+
+def _day_slot(ts: float) -> int:
+    local = time.localtime(ts)
+    return (local.tm_hour * 3600 + local.tm_min * 60) // SLOT_S
+
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 ENROLL_MIN_CONFIDENCE = 0.90
 PENDING_TTL_S = 120.0
 MAX_PENDING = 8
+# Lighting problems a photo may have when you chose to keep it anyway.
+LIGHT_ISSUES = frozenset({"too_dark", "too_bright"})
+# Frames you could not be recognised in (another sign-in proved it was you):
+# poor light is fine, but they still have to look like you.
+POOR_LIGHT_MIN_CONFIDENCE = 0.80
+POOR_LIGHT_SHARPNESS_FACTOR = 0.25
+SLOT_S = 600                 # time-of-day slots of ten minutes
+SLOT_FRESH_DAYS = 14.0
 RECENT_KEEP_FRACTION = 0.2
 
 
@@ -266,7 +279,7 @@ class Recognizer:
 
     # ---- enrollment --------------------------------------------------------
 
-    def _embed_images(self, paths: Iterable[Path]
+    def _embed_images(self, paths: Iterable[Path], *, allow_poor_light: bool = False
                       ) -> tuple[list[np.ndarray], list[str], list[float], list[str], list[ImageResult]]:
         embeddings, names, qualities, lighting, results = [], [], [], [], []
         for path in paths:
@@ -280,20 +293,21 @@ class Recognizer:
                 results.append(ImageResult(path.name, False, reason))
                 continue
             quality = assess(to_gray(image), faces[0].box, face_count=1)
-            if not quality.usable:
-                issue = primary_issue(quality.issues) or "image quality too low"
+            issues = [i for i in quality.issues if not (allow_poor_light and i in LIGHT_ISSUES)]
+            if not quality.usable and (not allow_poor_light or primary_issue(issues)):
+                issue = primary_issue(issues) or "image quality too low"
                 results.append(ImageResult(path.name, False, issue.replace("_", " ")))
                 continue
             embeddings.append(self.embedder.embed(faces)[0])
             names.append(path.name)
-            qualities.append(quality.score())
+            qualities.append(max(quality.score(), 0.05))
             lighting.append(quality.lighting)
             results.append(ImageResult(path.name, True, quality=quality.score()))
         return embeddings, names, qualities, lighting, results
 
     def build_profile(self, paths: list[Path], *, mode: str = "replace",
                       source: int = SOURCE_ENROLLMENT, dry_run: bool = False,
-                      holdout_every: int = 0) -> BuildReport:
+                      holdout_every: int = 0, allow_poor_light: bool = False) -> BuildReport:
         """Create (``replace``) or extend (``append``) the original enrollment.
 
         Replacing starts a fresh profile and discards learned samples, which
@@ -303,7 +317,8 @@ class Recognizer:
         """
         if mode not in ("replace", "append"):
             raise ValueError("mode must be 'replace' or 'append'")
-        embeddings, names, qualities, lighting, results = self._embed_images(paths)
+        embeddings, names, qualities, lighting, results = self._embed_images(
+            paths, allow_poor_light=allow_poor_light)
         if not embeddings:
             raise ValueError("No usable face was found in the photos")
         holdout: list[tuple[np.ndarray, str]] = []
@@ -556,26 +571,88 @@ class Recognizer:
                 self.metrics.record("learning_result", accepted=True, added=0,
                                     reason="no longer distinct from stored samples")
                 return LearnResult(0, "no longer distinct from stored samples")
-            updated, ids = profile.append(
-                np.stack([c.embedding for c in survivors]), source=SOURCE_UNLOCK,
-                created_at=self._clock(),
-                qualities=np.asarray([c.quality for c in survivors], dtype=np.float32),
-                lighting=np.asarray([lighting_code(c.lighting) for c in survivors],
-                                    dtype=np.int8))
-            self._install_locked(updated, persist=False)
-            self._apply_retention_locked(persist=False)
-            save_profile(self._profile, self.profile_path)  # type: ignore[arg-type]
-            for candidate, sample_id in zip(survivors, ids, strict=True):
-                self.metrics.record(
-                    "learned_sample", sample_id=sample_id, quality=candidate.quality,
-                    anchor_distance=candidate.anchor_distance, novelty=candidate.novelty,
-                    lighting=candidate.lighting)
-            for photo, sample_id in zip(photos, ids, strict=True):
-                if photo is not None:
-                    self._save_photo(photo, sample_id)
-            self.metrics.record("learning_result", accepted=True, added=len(ids),
-                                reason="learned")
-            return LearnResult(len(ids), "learned", ids)
+            return self._commit_locked(profile, survivors, photos, SOURCE_UNLOCK)
+
+    def _commit_locked(self, profile: FaceProfile, chosen: list[LearningCandidate],
+                       photos: list[np.ndarray | None], source: int) -> LearnResult:
+        updated, ids = profile.append(
+            np.stack([c.embedding for c in chosen]), source=source,
+            created_at=self._clock(),
+            qualities=np.asarray([c.quality for c in chosen], dtype=np.float32),
+            lighting=np.asarray([lighting_code(c.lighting) for c in chosen], dtype=np.int8))
+        self._install_locked(updated, persist=False)
+        self._apply_retention_locked(persist=False)
+        save_profile(self._profile, self.profile_path)  # type: ignore[arg-type]
+        for candidate, sample_id in zip(chosen, ids, strict=True):
+            self.metrics.record(
+                "learned_sample", sample_id=sample_id, quality=candidate.quality,
+                anchor_distance=candidate.anchor_distance, novelty=candidate.novelty,
+                lighting=candidate.lighting, source=source)
+        for photo, sample_id in zip(photos, ids, strict=True):
+            if photo is not None:
+                self._save_photo(photo, sample_id)
+        self.metrics.record("learning_result", accepted=True, added=len(ids), reason="learned")
+        return LearnResult(len(ids), "learned", ids)
+
+    def learn_now(self, analyses: list[FrameAnalysis], *, source: int, limit: int,
+                  max_anchor_distance: float, poor_light: bool = False) -> LearnResult:
+        """Learn up to ``limit`` distinct views at once, when it is known to be you.
+
+        Used after a password or PIN sign-in (``poor_light``: the views the
+        sign-in screen could not recognise) and while you sit at the PC.
+        Every view must still be a single face within ``max_anchor_distance``
+        of your *original* photos, so learned samples never drift away from
+        you, and nearly identical views are skipped.
+        """
+        cfg = self.cfg
+        if not cfg.adaptive_enrollment:
+            return LearnResult(0, "learning is off")
+        sharpness = cfg.adaptive_min_blur * (POOR_LIGHT_SHARPNESS_FACTOR if poor_light else 1.0)
+        confidence = (min(cfg.adaptive_min_face_confidence, POOR_LIGHT_MIN_CONFIDENCE)
+                      if poor_light else cfg.adaptive_min_face_confidence)
+        candidates = [
+            LearningCandidate(
+                a.embedding, max(a.quality.score() if a.quality else 0.0,
+                                 0.05 if poor_light else 0.0),
+                a.quality.lighting if a.quality else "unknown", a.face_confidence,
+                a.quality.face_ratio if a.quality else 0.0,
+                a.quality.face_sharpness if a.quality else 0.0, a.is_real, a.face_count)
+            for a in analyses if a.embedding is not None]
+        with self._lock:
+            profile = self._profile
+            if profile is None or not candidates:
+                return LearnResult(0, "nothing to learn")
+            anchors = profile.unit_rows[: profile.protected_count]
+            stored = profile.unit_rows
+            chosen: list[LearningCandidate] = []
+            remaining = list(candidates)
+            while remaining and len(chosen) < limit:
+                best = choose_learning_sample(
+                    remaining, anchors, stored, threshold=max_anchor_distance, match_margin=0.0,
+                    min_diversity=cfg.adaptive_min_diversity, min_face_confidence=confidence,
+                    min_face_ratio=cfg.adaptive_min_face_area_ratio, min_sharpness=sharpness)
+                if best is None:
+                    break
+                chosen.append(best)
+                stored = np.vstack((stored, unit(best.embedding)[None, :]))
+                remaining = [c for c in remaining if c is not best]
+            if not chosen:
+                reasons = [c.rejected for c in candidates if c.rejected]
+                why = max(set(reasons), key=reasons.count) if reasons else "nothing to learn"
+                self.metrics.record("learning_skipped", reason=why, frames=len(candidates),
+                                    source=source)
+                return LearnResult(0, why)
+            return self._commit_locked(profile, chosen, [None] * len(chosen), source)
+
+    def slot_recently_learned(self, ts: float) -> bool:
+        """Was a view learned in this ten-minute slot of the day within two weeks?"""
+        profile = self._profile
+        if profile is None or not profile.learned_count:
+            return False
+        created = profile.created_at[profile.protected_count:]
+        recent = created[created >= ts - SLOT_FRESH_DAYS * 86400.0]
+        slot = _day_slot(ts)
+        return any(_day_slot(float(t)) == slot for t in recent)
 
     def _save_photo(self, crop: np.ndarray, sample_id: int) -> None:
         try:

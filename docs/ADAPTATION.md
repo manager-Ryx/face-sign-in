@@ -18,12 +18,27 @@ you turn it on), **Recommend-only** (suggests; you decide).
   (`ReportResult` success from the tile) is the single most useful frame of that
   attempt added. "Useful" balances image quality (exposure, size, sharpness,
   facing the camera) against novelty (distance from everything stored).
-- **Never learned from.** Failed attempts, presence checks, recognition tests,
-  PIN/password sign-ins, frames with more than one face, dark/blurred/small
-  faces, or frames nearly identical to a stored sample. The earlier option to
-  learn from near-miss frames of failed attempts was removed.
-- **Drift protection.** A candidate must match one of your *original*
-  enrollment photos at least 0.10 more closely than the unlock threshold.
+- **After a password or PIN sign-in (on; *Also learn when I sign in with my
+  password*).** When face sign-in failed and you then signed in another way,
+  that proves it was you at the sign-in screen, so up to three distinct views
+  it saw in the 2 minutes before are learned – poor light allowed (lower
+  sharpness and detection bars), because those are exactly the conditions it
+  failed in. Each must be a single face within threshold + 0.15 of your
+  *original* photos (0.65 at the default 0.50): a stranger walking past is
+  typically 0.75 or more away and is never learned (tested). The views are
+  kept in memory only until the sign-in.
+- **While you sit at the PC (on; *Learn at different times of day while I'm
+  here*).** A presence check that recognised you may add one view if that ten
+  minutes of the day has no learned view from the last two weeks, at most one
+  every 10 minutes, so morning sun, overcast afternoons and lamp-light evenings
+  are all represented over time. It must match your original photos.
+- **Never learned from.** Failed attempts that were not followed by a password
+  or PIN sign-in, recognition tests, frames with more than one face, blurred or
+  small faces, or frames nearly identical to a stored sample.
+- **Drift protection.** A candidate from a face sign-in must match one of your
+  *original* enrollment photos at least 0.10 more closely than the unlock
+  threshold (presence: within the threshold; password: within threshold +
+  0.15).
   Learned samples never validate other learned samples, so there is no chain
   of slowly drifting samples. The check is repeated at commit time.
 - **Callbacks.** Each staged sample has a random 144-bit id. A missing report
@@ -195,7 +210,43 @@ an hour. Now it would lock again after about 2 minutes.
   timeout; never longer than your normal timeout. The active rule is shown on
   the Overview.
 
-## 9. When to re-enroll instead
+## 9. Lighting your face, not the window – Active (*Light my face properly*)
+
+- **Measured problem.** On a morning with a window behind the desk, the face
+  measured 42 (0-255) against a scene of 121: the camera exposes for the
+  window. Recognition then fails, and setup refused those photos as too dark.
+- **What this camera allows.** Probed on the NearStream V02AF through
+  DirectShow: no exposure, gain or backlight-compensation control; brightness
+  works (124 -> 164 lifted the face from 42 to 122).
+- **What happens.** When a face is visible after the camera settles and its
+  brightness is outside 80-165, brightness is stepped towards 115 – at most
+  three steps of a few frames each, so about 0.1-0.6 s only when needed. The
+  offset that worked is remembered per kind of light (backlit, dim, dark,
+  bright) and tried first next time. Nothing changes when nobody is in view.
+- **Bounds and undo.** Between -60 and +100 of the camera's own setting.
+  Every change is put back when the camera is released; a marker file means
+  even a crash can't leave the camera brighter for other apps (the next
+  capture restores it). The setup window uses the same adjustment.
+
+## 10. Fixed focus for your desk – Optional (*Set focus for my desk*)
+
+Autofocus can hunt, especially at night. *Set focus for my desk* sweeps the
+lens (positions 100-750, then ±40 in steps of 20) while you sit as usual and
+keeps the position where your face is sharpest; every capture then holds it,
+and *Use automatic focus* goes back. Autofocus is switched back on whenever
+the camera is released.
+
+## 11. Fail-safes when it isn't working
+
+- Selecting the Face Unlock tile (or pressing Enter on it) looks longer and at
+  more frames (up to 8, about 6 s) – never with a looser match.
+- Setup: *Take photo now* uses the current view for the angle being asked
+  for, even in poor light (such photos are kept when you save); *Skip this
+  angle* leaves out a turn or tilt you can't get it to accept; after 8 s on
+  one angle a smaller movement is enough.
+- Password or PIN always works, and now teaches the app what it missed (§1).
+
+## 12. When to re-enroll instead
 
 The Learning page suggests *Add my current appearance* when matches have
 drifted weaker over several weeks, when face sign-in often needed another
@@ -222,6 +273,8 @@ Generated from the code (`face_service/config.py`).
 | `camera_warmup_max_s` | Measured, automatic within bounds | `2.0` | 0.3-6 | Maximum seconds to wait for the image to settle. |
 | `camera_low_light_fps` | Measured, automatic within bounds | `15.0` | 0-30 | Frame rate requested in dim light so the camera can expose longer (0 disables). |
 | `persistent_camera` | You decide | `False` |  | Keep the camera open all the time (camera light stays on). |
+| `camera_face_exposure` | You decide | `True` |  | Adjust the camera's brightness so your face is well lit, for example with a bright window behind you. Undone whenever the camera is released. |
+| `camera_focus` | You decide | `0` | 0-1023 | Fixed focus position for your desk (0 uses the camera's automatic focus). Set it with "Set focus for my desk". |
 | `unlock_camera_hold_s` | Measured, automatic within bounds | `15.0` | 0-30 | Longest time the camera stays open between active lock-screen retries. |
 | `verify_frames` | Safeguard (never changes silently) | `5` | 1-30 | Frames examined by a manual verification check. |
 | `verify_required` | Safeguard (never changes silently) | `2` | 1-30 | Matching frames needed by a manual verification check. |
@@ -236,6 +289,8 @@ Generated from the code (`face_service/config.py`).
 | `unlock_client_check` | Safeguard (never changes silently) | `enforce` | off, log, enforce | Only the Windows sign-in screen may request your credentials ('enforce'); 'log' lets other programs ask but records them; 'off' skips the check. |
 | `unlock_wait_after_manual_lock` | Safeguard (never changes silently) | `True` |  | After you lock the PC yourself, face sign-in waits until you have stepped out of view, woken the screen or selected the Face Unlock tile. |
 | `adaptive_enrollment` | You decide | `False` |  | Learn your current appearance from confirmed face sign-ins. |
+| `adaptive_learn_after_password` | You decide | `True` |  | When face sign-in failed and you used your password or PIN, learn from the views the sign-in screen saw just before (poor light allowed; they must still be close to your original photos). |
+| `adaptive_learn_while_present` | You decide | `True` |  | While you are at the PC, learn one view at times of day not covered yet (at most one every 10 minutes), so every kind of daylight is represented. |
 | `adaptive_samples_per_unlock` | Safeguard (never changes silently) | `1` | 0-2 | Most face samples learned from one confirmed sign-in. |
 | `adaptive_max_embeddings` | You decide | `300` | 1-2000 | Most learned samples kept, in addition to your original enrollment. |
 | `adaptive_retention_days` | You decide | `0.0` | 0-3650 | Forget learned samples older than this many days (0 keeps them). |

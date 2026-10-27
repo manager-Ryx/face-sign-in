@@ -22,8 +22,10 @@ from face_service.service import FaceService
 
 SYSTEM = ClientInfo(4321, "S-1-5-18")
 USER = ClientInfo(1234, "S-1-5-21-1-2-3-1001")
-ME, STRANGER, NOBODY = 1, 2, 3
-ANGLES = {ME: 20.0, STRANGER: 80.0}           # NOBODY has no face at all
+ME, STRANGER, NOBODY, ME_BACKLIT = 1, 2, 3, 4
+# NOBODY has no face at all; ME_BACKLIT is you, too poorly lit to be recognised
+# (0.47 from your photos against a 0.45 threshold).
+ANGLES = {ME: 20.0, STRANGER: 80.0, ME_BACKLIT: 63.0}
 CREDENTIAL = {"u": "me", "p": "secret", "d": "."}
 
 
@@ -296,10 +298,45 @@ class ServiceTests(unittest.TestCase):
 
     # ---- presence ------------------------------------------------------------
 
-    def test_presence_check_never_learns(self) -> None:
+    def test_while_you_sit_it_learns_once_per_time_of_day(self) -> None:
         ScriptedCamera.script = [ME]
-        response = self.service.handle({"cmd": "presence"}, USER)
-        self.assertTrue(response["present"])
+        self.assertTrue(self.service.handle({"cmd": "presence"}, USER)["present"])
+        self.assertEqual(load_profile(EMBED_PATH).learned_count, 1)
+        self.service.handle({"cmd": "presence"}, USER)
+        self.assertEqual(load_profile(EMBED_PATH).learned_count, 1)  # this slot is covered
+
+    def test_learning_while_you_sit_can_be_turned_off(self) -> None:
+        self.service.cfg = Config(threshold=0.45, adaptive_enrollment=True,
+                                  adaptive_learn_while_present=False)
+        ScriptedCamera.script = [ME]
+        self.service.handle({"cmd": "presence"}, USER)
+        self.assertEqual(load_profile(EMBED_PATH).learned_count, 0)
+
+    # ---- learning after a password sign-in --------------------------------------
+
+    def password_sign_in_after(self, face: int) -> None:
+        """Locked while away; the sign-in screen sees ``face``; you type your password."""
+        self.service.handle({"cmd": "auto_lock", "away_s": 600}, USER)
+        self.watcher.emit("lock")
+        self.assertFalse(self.unlock([face])["ok"])
+        self.watcher.emit("unlock")  # signed in without your face
+        self.service.camera.release_now()
+
+    def test_after_a_password_sign_in_it_learns_how_you_looked(self) -> None:
+        self.password_sign_in_after(ME_BACKLIT)
+        profile = load_profile(EMBED_PATH)
+        self.assertEqual(profile.learned_count, 1)
+        self.assertEqual(int(profile.sources[-1]), 3)  # learned after a password sign-in
+        self.assertTrue(self.unlock([ME_BACKLIT])["ok"])  # recognised next time
+
+    def test_a_stranger_seen_before_a_password_sign_in_is_never_learned(self) -> None:
+        self.password_sign_in_after(STRANGER)
+        self.assertEqual(load_profile(EMBED_PATH).learned_count, 0)
+
+    def test_learning_after_a_password_can_be_turned_off(self) -> None:
+        self.service.cfg = Config(threshold=0.45, adaptive_enrollment=True,
+                                  adaptive_learn_after_password=False)
+        self.password_sign_in_after(ME_BACKLIT)
         self.assertEqual(load_profile(EMBED_PATH).learned_count, 0)
 
     def test_missing_profile_is_an_error_not_absence(self) -> None:

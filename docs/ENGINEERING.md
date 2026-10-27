@@ -8,6 +8,7 @@
 | Fixed warm-up after opening | 10 frames ≈ 0.6 s | stops when stable: 3 frames ≈ 0.1 s | same |
 | Cold lock-screen attempt | 2.27 s median (camera 1.9-2.1 s) | measure live: open 0.64-0.80 s + settle 0.1 s + analysis | old code in-process vs new service in-process |
 | ArcFace per face | 330-400 ms (1 thread, eager) | 87 ms (4 threads, compiled); 62 ms at 8 | 15-20 repetitions; outputs identical (max element difference 4e-7) |
+| Face brightness with a window behind (camera probe) | 42 face / 121 scene | 122 face at brightness 164 (camera default 124) | 20 frames per setting, YuNet face box; exposure, gain and backlight controls unavailable |
 | Service memory, model loaded | 828 MB in use, 1,098 MB committed | 561 MB in use, 571 MB committed | live service; cost: 96 -> 110 ms per face with TensorFlow's oneDNN kernels off (32 synthetic faces x 2 runs); outputs within 2e-7 cosine |
 | Tray memory | 785 MB committed (numpy BLAS reserves a buffer per CPU core) | 45 MB committed | live tray; one BLAS thread in both processes |
 | Failed attempt with nobody in view (warm camera) | 3 frames analysed | ~60-75 ms, detector only | new service in-process |
@@ -45,6 +46,8 @@ From a full read plus an independent review. "Fixed" items have tests.
 | Settings edited outside the app could be overwritten by the tray's stale copy | **Fixed** (the tray watches `config.toml` and reloads; tested) |
 | A face recognised while walking past (screens off) left the PC unlocked and unattended until the hour-long auto-lock | **Fixed** (a face sign-in must be confirmed by a presence check after 30 s; otherwise the PC locks again after 2 min; tested) |
 | Windows+L while still facing the camera was undone about 3.6 s later | **Fixed** (after a lock of your own, face sign-in waits until you have stepped away, woken the screen or selected the tile; tested) |
+| Setup's Cancel did nothing (its close handling and Qt's re-entered each other, so Qt refused the close) | **Fixed** (one cancel path; tested) |
+| The taskbar showed Python's icon | **Fixed** (the app sets its own Windows app ID) |
 | Presence checks were skipped for 35 s after a sign-in, and the absence timer only started at the next 5-minute check | **Fixed** (the sign-in screen releases the camera as soon as you are signed in) |
 | The caller check and request log wrote one entry per lock-screen request (9,186 records and ~900 log lines an hour overnight) | **Fixed** (one caller record per lock, plus any other caller; per-request lines at debug level) |
 | Learning from frames of failed attempts | **Removed** (brief: failed attempts never train) |

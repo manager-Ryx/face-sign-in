@@ -3,11 +3,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QSpinBox
+from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QHBoxLayout, QSpinBox, QWidget
 
 from ..icons import G
 from ..status import duration
-from ..widgets import Banner, Page, SettingRow, SettingsGroup, ToggleSwitch, button
+from ..widgets import (
+    Banner,
+    Page,
+    SettingRow,
+    SettingsGroup,
+    ToggleSwitch,
+    button,
+    subtle_button,
+)
 
 if TYPE_CHECKING:
     from ...app import AppController
@@ -166,6 +174,23 @@ class SettingsPage(Page):
         self.camera_row = SettingRow(G.CAMERA, "Camera", "", button("Choose camera…",
                                                                      self._choose_camera))
         group.add(self.camera_row)
+        group.add(SettingRow(G.SUN, "Light my face properly",
+                             "With a bright window behind you, the camera exposes for the window "
+                             "and your face ends up dark. This raises the camera's brightness "
+                             "for your face, and puts it back as soon as the camera is released.",
+                             b.toggle("camera_face_exposure")))
+        focus_controls = QWidget()
+        focus_controls.setObjectName("Transparent")
+        focus_layout = QHBoxLayout(focus_controls)
+        focus_layout.setContentsMargins(0, 0, 0, 0)
+        focus_layout.setSpacing(8)
+        self.focus_auto = subtle_button("Use automatic focus",
+                                        lambda: self.bindings.save(camera_focus=0))
+        self.focus_set = button("Set focus for my desk", self._calibrate_focus)
+        focus_layout.addWidget(self.focus_auto)
+        focus_layout.addWidget(self.focus_set)
+        self.focus_row = SettingRow(G.SCAN, "Focus", "", focus_controls)
+        group.add(self.focus_row)
 
         self.section("Appearance and notifications")
         group = self.add(SettingsGroup())
@@ -182,6 +207,32 @@ class SettingsPage(Page):
     def refresh(self) -> None:
         self.bindings.refresh()
         self._camera_text()
+        self._focus_text()
+
+    def _focus_text(self) -> None:
+        position = self.controller.cfg.camera_focus
+        self.focus_auto.setVisible(bool(position))
+        self.focus_row.set_description(
+            f"Fixed for your desk (lens position {position}). Automatic focus can hunt in low "
+            "light; a fixed focus doesn't." if position else
+            "Automatic. If the picture is often soft, especially at night, sit as you normally "
+            "do and select \u201cSet focus for my desk\u201d (about 10 seconds).")
+
+    def _calibrate_focus(self) -> None:
+        self.focus_set.setEnabled(False)
+        self.focus_row.set_description("Measuring \u2013 sit as you normally do and look at the "
+                                       "screen for about 10 seconds\u2026")
+
+        def done(reply) -> None:
+            self.focus_set.setEnabled(True)
+            if reply and reply.get("ok"):
+                self.bindings.save(camera_focus=int(reply["position"]))
+            else:
+                self.banner.show_message("caution", "Focus not set", (reply or {}).get(
+                    "message") or "Face Unlock isn't responding.")
+            self._focus_text()
+
+        self.controller.client.request({"cmd": "calibrate_focus"}, done, timeout_s=45.0)
 
     def _camera_text(self) -> None:
         status = self.controller.client.status or {}
