@@ -120,6 +120,7 @@ WRONG_PASSWORD_STATUS = frozenset({
 # screen, not you asking to be let back in (Windows+L while facing the camera).
 SELECTION_ARMS_AFTER_S = 10.0
 SERVICE_MUTEX = "Local\\FaceUnlockService"   # one service per signed-in session
+WAKE_COUNTS_S = 60.0        # a screen wake this soon before a sign-in starts its timing
 CAUGHT_TEXT = {"instant": "by face straight away", "quick-look": "by face on a quick look",
                "other": "another way"}
 
@@ -146,7 +147,23 @@ class _LockSession:
     first_face_at: float | None = None
     accepted_at: float | None = None
     accepted_mode: str | None = None
+    woke_at: float | None = None    # the screen last woke during this lock
     reasons: dict[str, int] = field(default_factory=dict)
+
+
+def sign_in_seconds(accepted_at: float | None, woke_at: float | None,
+                    first_face_at: float | None) -> float | None:
+    """How long a face sign-in took, as you'd feel it: from waking the screen (when
+    that happened just before), otherwise from the moment your face was first seen."""
+    if accepted_at is None:
+        return None
+    if woke_at is not None and 0.0 <= accepted_at - woke_at <= WAKE_COUNTS_S:
+        start = woke_at
+    elif first_face_at is not None and first_face_at <= accepted_at:
+        start = first_face_at
+    else:
+        return None
+    return round(accepted_at - start, 2)
 
 
 def password_rejected(accepted: bool, status: Any, substatus: Any) -> bool:
@@ -199,6 +216,7 @@ class FaceService:
         self._session_lock = threading.Lock()
         self._auto_lock_notice: tuple[float, float] | None = None  # (when, seconds away)
         self._face_sign_in_at: float | None = None                 # wall clock
+        self._face_sign_in_s: float | None = None                  # how long it took
         self._presence_learned_at = float("-inf")
         self._rejections = 0
         self._rejected_password: float | None = None   # mtime of the stored password then
@@ -223,6 +241,9 @@ class FaceService:
             state = name.split("-", 1)[1]
             if state == "on":
                 self._arm("woke the screen")
+                with self._session_lock:
+                    if self._lock_session is not None:
+                        self._lock_session.woke_at = self._clock()
             self.pacer.display_changed(state)
         elif name == "lock":
             self._open_lock_session()
@@ -273,6 +294,8 @@ class FaceService:
             "lock_session", duration_s=away_s, face_seen=session.face_seen,
             face_accepted=session.face_accepted, attempts=session.attempts,
             time_to_unlock_s=time_to_unlock, caught=caught,
+            sign_in_s=sign_in_seconds(session.accepted_at, session.woke_at,
+                                      session.first_face_at),
             scanning_s=round(spent.get("active", 0.0), 1),
             quick_look_s=round(spent.get("idle", 0.0), 1),
             screen_off_s=round(spent.get("display-off", 0.0), 1),
@@ -665,9 +688,13 @@ class FaceService:
         self._note_password_result(accepted, password_rejected(accepted, status, substatus))
         if accepted:
             self._face_sign_in_at = self._wall_clock()
+            self._face_sign_in_s = None
             with self._session_lock:
-                if self._lock_session is not None:
-                    self._lock_session.face_accepted = True
+                session = self._lock_session
+                if session is not None:
+                    session.face_accepted = True
+                    self._face_sign_in_s = sign_in_seconds(
+                        session.accepted_at, session.woke_at, session.first_face_at)
             if attempt.eval_embedding is not None:
                 self.evaluation.add([attempt.eval_embedding], source="unlock",
                                     lighting=[attempt.eval_lighting],
@@ -877,6 +904,7 @@ class FaceService:
                             "waiting_for_you_to_leave": bool(
                                 self._lock_session and not self._lock_session.armed)},
             "last_face_sign_in": self._face_sign_in_at,
+            "last_face_sign_in_s": self._face_sign_in_s,
         }
 
     def insights(self, days: float = 30.0) -> dict:

@@ -243,6 +243,8 @@ class Config:
     language: str = _setting(None, P, "Interface language.", factory=_default_language)
     theme: str = _setting("system", P, "Light, dark, or follow Windows.", choices=THEMES)
     notifications: bool = _setting(True, P, "Show desktop notifications.")
+    capture_sounds: bool = _setting(True, P, "Play a soft shutter sound for each photo taken "
+                                    "during face setup.")
     check_for_updates: bool = _setting(
         False, P, "Check the upstream project for new releases at start-up.")
     metrics_retention_days: int = _setting(

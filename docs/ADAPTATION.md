@@ -320,5 +320,6 @@ Generated from the code (`face_service/config.py`).
 | `language` | You decide | `from Windows` |  | Interface language. |
 | `theme` | You decide | `system` | system, light, dark | Light, dark, or follow Windows. |
 | `notifications` | You decide | `True` |  | Show desktop notifications. |
+| `capture_sounds` | You decide | `True` |  | Play a soft shutter sound for each photo taken during face setup. |
 | `check_for_updates` | You decide | `False` |  | Check the upstream project for new releases at start-up. |
 | `metrics_retention_days` | You decide | `90` | 7-365 | Days of local measurements kept for the Learning page. |

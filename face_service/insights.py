@@ -46,6 +46,8 @@ def build_insights(service: FaceService, *, days: float = 30.0) -> dict[str, Any
         "sessions": len(sessions), "face_unlocked": len(unlocked),
         "rate": round(len(unlocked) / len(sessions), 3) if sessions else None,
         "median_time_s": _median([e.get("time_to_unlock_s") for e in unlocked]),
+        # Every face sign-in in the period (not only the last 30), for the weekly summary.
+        "face_sign_ins": sum(1 for e in by_kind["lock_session"] if e.get("face_accepted")),
         "recent": [{"at": e["ts"], "face": bool(e.get("face_accepted")),
                     "reason": e.get("top_reason", "")} for e in sessions[-10:]][::-1],
     }
