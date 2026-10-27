@@ -128,6 +128,64 @@ foreach ($task in 'FaceUnlock-Service', 'FaceUnlock-Presence') {
 }
 Start-Sleep -Seconds 5
 Start-Process -FilePath (Join-Path $installDir 'face_unlock_tray.exe') -ArgumentList '--welcome'
-Say 'First-run setup is opening. It needs you for three things: your Windows account password'
+
+# ---- 6. Did it really start? ---------------------------------------------------------------
+# Installing the files is not the same as the app working: check both programs answer.
+function Get-ServiceStatus {
+    try {
+        $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'FaceUnlock', [System.IO.Pipes.PipeDirection]::InOut)
+        $pipe.Connect(2000)
+        $pipe.ReadMode = [System.IO.Pipes.PipeTransmissionMode]::Message
+        $request = [Text.Encoding]::UTF8.GetBytes('{"cmd":"status"}')
+        $pipe.Write($request, 0, $request.Length)
+        $buffer = New-Object byte[] 65536
+        $count = $pipe.Read($buffer, 0, $buffer.Length)
+        $pipe.Dispose()
+        return [Text.Encoding]::UTF8.GetString($buffer, 0, $count) | ConvertFrom-Json
+    } catch { return $null }
+}
+$trayPipe = "FaceUnlockTray-$env:USERNAME"
+$status = $null
+$trayUp = $false
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline -and -not ($status -and $trayUp)) {
+    Start-Sleep -Seconds 3
+    if (-not $status) { $status = Get-ServiceStatus }
+    $trayUp = @([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like "*\$trayPipe" }).Count -gt 0
+}
+$logs = Join-Path $env:USERPROFILE '.face-unlock'
+$healthy = $true
+if (-not $trayUp) {
+    $healthy = $false
+    Say 'Problem: the Face Unlock app did not start (it may be showing an error window).'
+}
+if (-not $status) {
+    $healthy = $false
+    Say "Problem: the background service is not answering. See $logs\service.log"
+} else {
+    Say "Background service $($status.version) is running."
+    $deadline = (Get-Date).AddMinutes(5)
+    while ((Get-Date) -lt $deadline -and -not $status.recognition.model_loaded -and
+           -not $status.recognition.model_error) {
+        Say 'Preparing the face model (it downloads once, about 130 MB)...'
+        Start-Sleep -Seconds 15
+        $next = Get-ServiceStatus
+        if ($next) { $status = $next }
+    }
+    if ($status.recognition.model_loaded) {
+        Say 'Face model ready.'
+    } elseif ($status.recognition.model_error) {
+        $healthy = $false
+        Say "Problem: the face model could not be prepared: $($status.recognition.model_error)"
+    } else {
+        Say 'The face model is still downloading; setup shows its progress.'
+    }
+}
+if (-not $healthy) {
+    Say "Installed, but not working yet. Logs (no images or passwords): $logs\service.log, $logs\presence.log"
+    Say 'Please report it at https://github.com/manager-Ryx/face-sign-in/issues with those logs.'
+    exit 1
+}
+Say 'First-run setup is open. It needs you for three things: your Windows account password'
 Say '(typed into the setup window, never anywhere else), about a minute in front of the camera,'
-Say 'and a few preferences. Be online: the face model downloads once (about 130 MB).'
+Say 'and a few preferences.'

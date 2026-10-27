@@ -31,7 +31,14 @@ from PySide6.QtWidgets import (
 )
 
 from .. import system_setup
-from .dialogs import store_windows_password, windows_account
+from .dialogs import (
+    PASSWORD_REASON,
+    microsoft_account,
+    open_password_help,
+    password_hint,
+    store_windows_password,
+    windows_account,
+)
 from .icons import G, GlyphLabel
 from .widgets import (
     Banner,
@@ -43,6 +50,7 @@ from .widgets import (
     button,
     hbox,
     label,
+    subtle_button,
 )
 
 if TYPE_CHECKING:
@@ -273,18 +281,26 @@ class OnboardingWizard(QDialog):
             "password, as if you had typed it. It's checked with Windows first, then stored "
             "encrypted so only your account on this PC can read it.")
         user, domain = windows_account()
-        layout.addWidget(label(f"Account: {domain}\\{user}", "Secondary"))
+        email = microsoft_account()
+        layout.addWidget(label(f"Microsoft account: {email}" if email
+                               else f"Account: {domain}\\{user}", "Secondary"))
+        layout.addWidget(label(password_hint(email), "Body2", wrap=True))
         self.secret = QLineEdit()
         self.secret.setEchoMode(QLineEdit.EchoMode.Password)
-        self.secret.setPlaceholderText("Windows password")
+        self.secret.setPlaceholderText("Microsoft account password" if email
+                                       else "Windows password")
         self.secret.setAccessibleName("Windows password")
         self.secret.returnPressed.connect(self._save_password)
         self.secret.setMinimumWidth(320)
         save = accent_button("Check and save", self._save_password)
         layout.addLayout(hbox(self.secret, save, spacing=8, stretch_at=2))
-        layout.addWidget(label("Signing in with a Microsoft account? Use its password, not your "
-                               "PIN. If you change your password later, Face Unlock will ask "
-                               "for the new one.", "Caption", wrap=True))
+        self.show_secret = QCheckBox("Show password")
+        self.show_secret.toggled.connect(lambda shown: self.secret.setEchoMode(
+            QLineEdit.EchoMode.Normal if shown else QLineEdit.EchoMode.Password))
+        forgot = subtle_button("Forgot it?", lambda: open_password_help(email))
+        layout.addLayout(hbox(self.show_secret, forgot, spacing=16, stretch_at=2))
+        layout.addWidget(label(PASSWORD_REASON + " If you change your password later, Face "
+                               "Unlock will ask for the new one.", "Caption", wrap=True))
         self.password_state = label("", "Body2", wrap=True)
         layout.addWidget(self.password_state)
         layout.addStretch(1)
@@ -463,6 +479,11 @@ class OnboardingWizard(QDialog):
             recognition = status.get("recognition") or {}
             if recognition.get("model_loaded"):
                 self.row_model.show_state("ok", "Ready.")
+            elif recognition.get("model_error"):
+                self.row_model.show_state(
+                    "problem", "The face model couldn't be prepared "
+                    f"({recognition['model_error']}). Check the internet connection, then try "
+                    "again.", "Try again", self._prepare_model)
             else:
                 self.row_model.show_state(
                     "working", "Preparing…" if recognition.get("model_present") else
@@ -556,6 +577,10 @@ class OnboardingWizard(QDialog):
     def _open_hello() -> None:
         import os
         os.startfile("ms-settings:signinoptions")  # type: ignore[attr-defined]
+
+    def _prepare_model(self) -> None:
+        self.controller.client.request({"cmd": "prepare_model"},
+                                       lambda _r: self.controller.client.refresh_status())
 
     def _save_password(self) -> None:
         """Checking with Windows can take seconds on work PCs: off the UI thread."""

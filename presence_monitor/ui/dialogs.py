@@ -25,7 +25,7 @@ from face_service.camera import list_cameras
 from face_service.config import ENROLL_DIR
 
 from .icons import G, GlyphLabel
-from .widgets import Banner, ProgressRing, accent_button, button, hbox, label
+from .widgets import Banner, ProgressRing, accent_button, button, hbox, label, subtle_button
 
 if TYPE_CHECKING:
     from ..app import AppController
@@ -77,6 +77,59 @@ def windows_account() -> tuple[str, str]:
     return os.environ.get("USERNAME", ""), os.environ.get("USERDOMAIN", ".")
 
 
+MICROSOFT_RESET_URL = "https://account.live.com/password/reset"
+
+
+def microsoft_account() -> str | None:
+    """The Microsoft account (email) this Windows account signs in with.
+
+    None for a local account, a work or school account, or when Windows won't say.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class UserInfo24(ctypes.Structure):
+        _fields_ = [("internet_identity", wintypes.BOOL), ("flags", wintypes.DWORD),
+                    ("internet_provider_name", wintypes.LPWSTR),
+                    ("internet_principal_name", wintypes.LPWSTR),
+                    ("user_sid", ctypes.c_void_p)]
+
+    try:
+        netapi = ctypes.WinDLL("netapi32")
+    except OSError:
+        return None
+    netapi.NetUserGetInfo.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                      ctypes.POINTER(ctypes.c_void_p)]
+    buffer = ctypes.c_void_p()
+    try:
+        if netapi.NetUserGetInfo(None, os.environ.get("USERNAME", ""), 24,
+                                 ctypes.byref(buffer)) != 0 or not buffer:
+            return None
+        info = ctypes.cast(buffer, ctypes.POINTER(UserInfo24)).contents
+        email = info.internet_principal_name if info.internet_identity else None
+        return str(email) if email else None
+    finally:
+        if buffer:
+            netapi.NetApiBufferFree(buffer)
+
+
+def password_hint(email: str | None) -> str:
+    """Which password to type."""
+    return (f"Use the password of your Microsoft account ({email}) – the one for Outlook, "
+            "Xbox or account.microsoft.com – not your PIN." if email
+            else "Use your Windows account password, not your PIN.")
+
+
+PASSWORD_REASON = ("Why not your PIN? Windows keeps the PIN for its own sign-in and never "
+                   "shows apps the password you signed in with, so Face Unlock needs it typed "
+                   "once.")
+
+
+def open_password_help(email: str | None) -> None:
+    """For a forgotten password: Microsoft's reset page, or Windows' Sign-in options."""
+    os.startfile(MICROSOFT_RESET_URL if email else "ms-settings:signinoptions")  # type: ignore[attr-defined]
+
+
 def verify_windows_password(user: str, domain: str, secret: str) -> tuple[bool, str]:
     """Check the password with Windows before it is stored.
 
@@ -94,8 +147,13 @@ def verify_windows_password(user: str, domain: str, secret: str) -> tuple[bool, 
         return True, ""
     except pywintypes.error as exc:
         if exc.winerror == 1326:  # ERROR_LOGON_FAILURE
-            return False, ("Windows didn't accept that password. If you sign in with a "
-                           "Microsoft account, use its password, not your PIN.")
+            email = microsoft_account()
+            which = (f"the password of your Microsoft account ({email})" if email
+                     else "your Windows account password")
+            return False, (f"Windows didn't accept that password. It needs to be {which}, "
+                           "not your PIN. Don't know it? Use “Forgot it?”. If you've just "
+                           "changed it, lock your PC and sign in with the new password once, "
+                           "then try again here.")
         if exc.winerror == 1327:  # ERROR_ACCOUNT_RESTRICTION, e.g. no blank passwords
             return False, "Windows doesn't allow this account to sign in with a password."
         return False, f"Windows couldn't check the password ({exc.strerror})."
@@ -133,7 +191,9 @@ class PasswordDialog(Dialog):
             "Face sign-in hands this password to Windows when it recognises you. It's encrypted "
             "with Windows (DPAPI) so only your account on this PC can read it. If you change your "
             "Windows password, update it here too.", "Body2", wrap=True))
-        self.body.addWidget(label(f"Account: {self.domain}\\{self.user}", "Secondary"))
+        self.email = microsoft_account()
+        self.body.addWidget(label(f"Microsoft account: {self.email}" if self.email
+                                  else f"Account: {self.domain}\\{self.user}", "Secondary"))
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setPlaceholderText("Windows password")
@@ -146,9 +206,12 @@ class PasswordDialog(Dialog):
         self.show_box.toggled.connect(self._show)
         self.body.addWidget(self.password)
         self.body.addWidget(self.repeat)
-        self.body.addWidget(self.show_box)
-        self.body.addWidget(label("This is your Windows account password, not your PIN.",
-                                  "Caption"))
+        self.body.addLayout(hbox(self.show_box,
+                                 subtle_button("Forgot it?",
+                                               lambda: open_password_help(self.email)),
+                                 spacing=16, stretch_at=2))
+        self.body.addWidget(label(password_hint(self.email) + " " + PASSWORD_REASON, "Caption",
+                                  wrap=True))
         self.banner = Banner()
         self.body.addWidget(self.banner)
         self.add_buttons("Save", destructive=False)

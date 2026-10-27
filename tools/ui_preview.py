@@ -205,13 +205,18 @@ def render(output: Path, theme_name: str, scale: float) -> list[Path]:
 
 def _render_onboarding(app, controller, output: Path, theme_name: str) -> list[Path]:
     """Every first-run step, with simulated PC checks (nothing on this PC is touched)."""
+    from unittest.mock import patch
+
     from presence_monitor.system_setup import TileState
     from presence_monitor.ui.onboarding import STEPS, OnboardingWizard, SystemChecks
     checks = SystemChecks(tile_state=lambda: TileState(False, problem="not installed"),
                           install_tile=lambda: (True, ""), autostart_state=lambda: "tasks",
                           enable_autostart=lambda: (True, ""), hello_only=lambda: False,
                           start_service=lambda: None)
-    wizard = OnboardingWizard(controller, None, checks=checks)  # type: ignore[arg-type]
+    # A made-up account, so renders never show the real one.
+    with patch("presence_monitor.ui.onboarding.microsoft_account",
+               return_value="you@example.com"):
+        wizard = OnboardingWizard(controller, None, checks=checks)  # type: ignore[arg-type]
     wizard.resize(820, 700)
     wizard._local = {"tile": checks.tile_state(), "hello": False, "autostart": "tasks"}
     written = []

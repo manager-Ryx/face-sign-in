@@ -101,9 +101,11 @@ What the script does:
 3. Runs Setup silently. Windows shows a permission prompt, which may flash
    in the taskbar rather than come to the front.
 4. Starts the background service and tray app, and opens first-run setup.
+5. Checks that both programs are really running, and waits up to 5 minutes
+   for the face model.
 
-It can take several minutes, so use a long timeout or run it in the
-background.
+It exits with 1 and says what failed if the app didn't start properly. It can
+take several minutes, so use a long timeout or run it in the background.
 
 Options: `-DownloadOnly` downloads and verifies without installing.
 `-SkipChecks` installs even if a check fails.
@@ -134,7 +136,9 @@ pages, and what to tell the person on each:
    pick the one in front of them.
 3. **Password:** their Windows *account* password, not their PIN. They type
    it here themselves. The app checks it with Windows, then encrypts it for
-   their account only.
+   their account only. The page shows which account it is: for a Microsoft
+   account, its email. It has **Show password** and a **Forgot it?** link. If
+   they don't know the password, see the next section.
 4. **Your face:** about a minute, looking at the camera and turning their head
    slowly as shown. Good light on their face helps; a bright window behind
    them makes it harder. If an angle won't register, they can press **Take
@@ -144,6 +148,49 @@ pages, and what to tell the person on each:
    sensible.
 6. **Try it:** a recognition test. *Lock my PC now* is for them to press,
    not you.
+
+### If they don't know their password
+
+This is common: many people only ever type their PIN.
+
+**Why the PIN won't do.** Windows lets only its own Windows Hello sign-in use
+the PIN; it is tied to the PC's security chip. Windows also never shows any
+app the password someone signed in with, even while they are signed in. A
+third-party sign-in tile like Face Unlock can only hand Windows the account
+password, so the person has to type it once. Explain this plainly if they ask.
+
+**Find out which account it is:**
+
+```powershell
+Get-LocalUser -Name $env:USERNAME | Select-Object Name, PrincipalSource
+```
+
+- `MicrosoftAccount` means the password is the one for their Microsoft account
+  (Outlook, Xbox, account.microsoft.com). The setup page shows the email.
+- `Local` means a password set on this PC only.
+- An error, or `ActiveDirectory`/`AzureAD`, means a work or school account
+  managed by an organisation.
+
+**Microsoft account.** They reset it themselves at
+<https://account.live.com/password/reset> (the setup page's **Forgot it?**
+opens it). Microsoft sends a code to their email or phone. You can open the
+page for them; the code and the new password are theirs to enter. Then:
+
+- If setup doesn't accept the new password straight away, ask them to lock
+  the PC and sign in once with it (*Sign-in options* → the key icon), then try
+  again.
+- If they've made their Microsoft account *passwordless*, there is no password
+  to type. They turn that off at account.microsoft.com → Security → Advanced
+  security options, which asks them to set a password. It's their decision.
+
+**Local account.** They change it in *Settings → Accounts → Sign-in options →
+Password*, which asks for the current one. If nobody knows the current
+password, don't reset it from an administrator account (`net user`, Computer
+Management) without warning them first. A forced reset makes Windows lose that
+account's saved passwords and encrypted files (Microsoft documents this).
+
+**Work or school account.** Their IT department handles passwords. Don't try
+to work around it.
 
 ### Step 4 – Check it and explain what's left
 
@@ -178,13 +225,43 @@ and look at the camera.
 | Stuck at the lock screen | *Sign-in options* → PIN or password always works. Safe Mode turns off all third-party sign-in tiles |
 | Work or school PC | An organisation's policy may block third-party sign-in tiles, or require Windows Hello. The person should ask their IT department; don't work around policy |
 
-Restart the app's background parts (tell the person first: face sign-in is
-unavailable for about 20 seconds):
+Restart the app's background parts. Tell the person first: face sign-in is
+unavailable for about 20 seconds. Wait for the old programs to exit before
+starting new ones. A new service started while the old one is still shutting
+down waits up to 15 seconds, then gives up.
 
 ```powershell
 Stop-ScheduledTask FaceUnlock-Presence; Stop-ScheduledTask FaceUnlock-Service
+Wait-Process -Name face_service, face_unlock_tray -Timeout 30 -ErrorAction SilentlyContinue
 Start-ScheduledTask FaceUnlock-Service; Start-ScheduledTask FaceUnlock-Presence
 ```
+
+If the setup window shows **Face recognition model** with a problem (for
+example, the download failed), fix the connection and press **Try again**
+there or on the Overview. Don't download model files by hand.
+
+### Reporting a problem
+
+If the installed app itself is broken (a crash window, a failed model load,
+a missing file), report it rather than patching files under
+`C:\Program Files\WindowsFaceUnlock`. Patched files hide the bug from
+everyone else, and the next update replaces them. If the person needs it
+working now and agrees, a repair is their call. Record exactly what you
+changed, and include it in the report.
+
+Open an issue at <https://github.com/manager-Ryx/face-sign-in/issues>. A good
+report has:
+
+- the release tag and the installer's SHA-256;
+- the Windows version;
+- the output of `check_install.ps1`;
+- the error text or traceback;
+- the relevant lines of `%USERPROFILE%\.face-unlock\service.log` and
+  `presence.log`.
+
+The logs hold no images or passwords. Still, read them before sharing, and
+leave out anything the person considers private: their camera's name and
+their account name appear in them.
 
 ### Uninstalling
 

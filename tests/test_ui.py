@@ -66,6 +66,13 @@ class SummaryTests(unittest.TestCase):
         overview = summarize(status(credentials=False), SNAPSHOT, self.cfg)
         self.assertEqual(overview.action, "password")
 
+    def test_a_face_model_that_cannot_be_prepared_offers_a_retry(self) -> None:
+        recognition = dict(STATUS["recognition"], model_error="url unreachable")
+        overview = summarize(status(not_ready=["model-unavailable"], recognition=recognition),
+                             SNAPSHOT, self.cfg)
+        self.assertEqual(overview.action, "prepare-model")
+        self.assertIn("url unreachable", overview.message)
+
     def test_photo_protection_that_cannot_start_is_explained(self) -> None:
         overview = summarize(status(not_ready=["anti-spoofing-unavailable"]), SNAPSHOT, self.cfg)
         self.assertEqual((overview.action, overview.alert_key),

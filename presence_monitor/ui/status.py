@@ -42,6 +42,7 @@ REASONS = {
     "just-locked": "Locked by you – waits until you step away",
     "password-rejected": "Saved password out of date",
     "anti-spoofing-unavailable": "Photo protection unavailable",
+    "model-unavailable": "Face model unavailable",
 }
 
 
@@ -229,6 +230,12 @@ def summarize(status: dict | None, snapshot: dict, cfg: Config,
                    "sign-in can work again – until then it won't try, so Windows doesn't count "
                    "failed sign-ins.", "password", "Update password", "attention",
                    "Needs your new password", "password-rejected")
+    if "model-unavailable" in (status.get("not_ready") or []):
+        error = (status.get("recognition") or {}).get("model_error") or "unknown error"
+        return out("caution", "The face model couldn't be prepared",
+                   f"It downloads once (about 130 MB) and needs the internet ({error}). "
+                   "Face sign-in waits until it's ready.", "prepare-model", "Try again",
+                   "attention", "Face model unavailable", "model-unavailable")
     if "anti-spoofing-unavailable" in (status.get("not_ready") or []):
         return out("caution", "Photo protection couldn't start",
                    "Its small model downloads once (this needs the internet), or PyTorch is "

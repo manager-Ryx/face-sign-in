@@ -42,8 +42,9 @@ jobs:
         shell: powershell
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          # The exact versions the app was tested with: newer DeepFace releases, for
+          # one, expect different model files than the ones bundled.
+          pip install -r installer\requirements-lock.txt --extra-index-url https://download.pytorch.org/whl/cpu
           pip install pyinstaller==6.11.1
 
       - name: Install Inno Setup
@@ -93,6 +94,27 @@ jobs:
           if (-not (Test-Path dist\WindowsFaceUnlock\credential_provider\FaceCredentialProvider.dll)) {
             throw "FaceCredentialProvider.dll was not built"
           }
+
+      - name: Smoke-test both programs as built (windowed, empty model folder)
+        shell: powershell
+        run: |
+          # Runs the packaged programs themselves, the way a new PC would: no Python
+          # installed, no console, and no models yet (the service downloads them).
+          $work = Join-Path $env:RUNNER_TEMP 'smoke'
+          New-Item -ItemType Directory "$work\deepface", "$work\home" -Force | Out-Null
+          $env:DEEPFACE_HOME = "$work\deepface"
+          $env:FACE_UNLOCK_HOME = "$work\home"
+          $env:FACE_UNLOCK_PIPE = '\\.\pipe\FaceUnlockSmoke'
+          $failed = $false
+          foreach ($program in 'face_unlock_tray', 'face_service') {
+            $report = "$work\$program.json"
+            $p = Start-Process "dist\WindowsFaceUnlock\$program.exe" -ArgumentList '--smoke-test', $report -PassThru
+            if (-not $p.WaitForExit(900000)) { $p.Kill(); Write-Host "$program timed out"; $failed = $true; continue }
+            Write-Host "---- $program (exit $($p.ExitCode))"
+            if (Test-Path $report) { Get-Content $report } else { Write-Host 'no report written' }
+            if ($p.ExitCode -ne 0) { $failed = $true }
+          }
+          if ($failed) { throw 'A packaged program failed its smoke test: not publishing.' }
 
       - name: Detect SignPath config
         id: signcheck

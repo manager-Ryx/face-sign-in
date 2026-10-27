@@ -170,6 +170,8 @@ class HomePage(Page):
             confirm_moved_camera(c, self)
         elif self._action in ("camera-settings", "settings"):
             c.show_main("settings")
+        elif self._action == "prepare-model":
+            c.client.request({"cmd": "prepare_model"}, lambda _r: c.client.refresh_status())
 
     def _check_presence(self) -> None:
         self.result_row.show()

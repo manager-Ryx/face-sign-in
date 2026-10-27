@@ -90,6 +90,7 @@ $explain = @{
     'camera-ambiguous'          = 'Several matching cameras: choose one in Settings.'
     'camera-unpinned'           = 'No camera chosen: choose one in Settings or first-run setup.'
     'anti-spoofing-unavailable' = 'Photo protection could not load its model: connect to the internet, or turn photo protection off in Settings.'
+    'model-unavailable'         = 'The face model could not be prepared (it downloads once, about 130 MB): connect to the internet, then Overview > "Try again".'
 }
 if ($status) {
     Show 'Service status' $true "version $($status.version), $(if ($status.warming -ne 'ready') { 'still starting' } else { 'started' })"

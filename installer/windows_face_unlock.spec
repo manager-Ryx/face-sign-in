@@ -2,12 +2,14 @@
 # single shared dist folder. Run from the repo root:
 #     pyinstaller installer/windows_face_unlock.spec --noconfirm --clean
 #
-# The two entry points share runtime binaries via MERGE so TensorFlow and
-# torch are only laid down once (~250 MB saved).
+# Both programs go into one COLLECT, which lays shared files (Python, numpy,
+# OpenCV) down once. Each keeps all of its own Python modules: an earlier
+# MERGE() moved modules both use into one program only, and the tray then
+# couldn't import numpy.
 
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
-from PyInstaller.building.api import PYZ, EXE, COLLECT, MERGE
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
+from PyInstaller.building.api import PYZ, EXE, COLLECT
 from PyInstaller.building.build_main import Analysis
 
 REPO_ROOT = Path(SPECPATH).resolve().parent
@@ -56,10 +58,28 @@ if weights_dir.exists():
 
 TRAY_DATAS = collect_data_files("cv2") + MODELS
 
+
+def metadata(*names):
+    """Package metadata some libraries read at run time (gdown reads its own
+    version on import, for example); missing packages are skipped."""
+    found = []
+    for name in names:
+        try:
+            found += copy_metadata(name)
+        except Exception:
+            pass
+    return found
+
+
+SERVICE_DATAS += metadata("gdown", "deepface", "tensorflow", "tf_keras", "keras", "numpy",
+                          "tqdm", "requests", "torch", "torchvision", "opencv-python",
+                          "h5py", "protobuf", "filelock", "pillow")
+TRAY_DATAS += metadata("numpy", "opencv-python", "PySide6_Essentials", "shiboken6")
+
 COMMON_EXCLUDES = [
     "matplotlib", "PyQt5", "PyQt6", "PySide2", "tkinter",
     "jupyter", "ipykernel", "notebook",
-    "tensorflow.lite.experimental.microfrontend",
+    # Not tensorflow.lite.experimental.microfrontend: TensorFlow 2.21 imports it.
     "scipy.spatial.cKDTree",  # huge, unused
 ]
 SERVICE_EXCLUDES = COMMON_EXCLUDES + ["PySide6", "shiboken6"]
@@ -93,13 +113,6 @@ tray_analysis = Analysis(
     excludes=TRAY_EXCLUDES,
     cipher=BLOCK_CIPHER,
     noarchive=False,
-)
-
-# Share Python DLLs + site-packages between the two EXEs to avoid doubling
-# the bundle size.
-MERGE(
-    (service_analysis, "face_service", "face_service"),
-    (tray_analysis, "face_unlock_tray", "face_unlock_tray"),
 )
 
 service_pyz = PYZ(service_analysis.pure, service_analysis.zipped_data, cipher=BLOCK_CIPHER)

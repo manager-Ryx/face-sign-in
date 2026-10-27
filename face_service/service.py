@@ -18,7 +18,7 @@ Commands used by the tray app and tools:
   learning_undo, learning_reset, threshold_apply, threshold_clear,
   snapshot_restore, camera_list, clear_measurements, low_light_reset, routine_reset,
   auto_lock (the presence monitor is about to lock because you are away),
-  calibrate_focus.
+  calibrate_focus, prepare_model (retry loading the models).
 """
 from __future__ import annotations
 
@@ -115,6 +115,7 @@ WRONG_PASSWORD_STATUS = frozenset({
 # A tile selection this soon after the lock is Windows setting up the sign-in
 # screen, not you asking to be let back in (Windows+L while facing the camera).
 SELECTION_ARMS_AFTER_S = 10.0
+SERVICE_MUTEX = "Local\\FaceUnlockService"   # one service per signed-in session
 CAUGHT_TEXT = {"instant": "by face straight away", "quick-look": "by face on a quick look",
                "other": "another way"}
 
@@ -197,6 +198,8 @@ class FaceService:
         self._presence_learned_at = float("-inf")
         self._rejections = 0
         self._rejected_password: float | None = None   # mtime of the stored password then
+        self._model_error: str | None = None   # why the recognition model couldn't load
+        self._preparing = threading.Lock()
         self._caller_seen: tuple[str | None, bool] | None = None
         self._device_status: tuple[float, dict] | None = None
         self._ready_reason = "starting"
@@ -832,6 +835,8 @@ class FaceService:
             reasons.append("password-rejected")
         if device.get("state") != "ready":
             reasons.append(f"camera-{device.get('state')}")
+        if self._model_error and not self.recognizer.embedder.loaded:
+            reasons.append("model-unavailable")
         if self.cfg.anti_spoofing and self.recognizer.embedder.spoof_error:
             reasons.append("anti-spoofing-unavailable")
         ready = not reasons
@@ -852,6 +857,7 @@ class FaceService:
                             "model": self.cfg.model_name, "strategy": self.cfg.unlock_strategy,
                             "model_loaded": self.recognizer.embedder.loaded,
                             "model_present": recognition_model_present(),
+                            "model_error": self._model_error,
                             "compiled": self.recognizer.embedder.compiled_ok},
             "learning": {"enabled": self.cfg.adaptive_enrollment, "last": last_learned},
             "credentials": CREDS_PATH.exists(),
@@ -918,6 +924,7 @@ class FaceService:
             "auto_lock": lambda r, c: self._expect_auto_lock(r.get("away_s"),
                                                              r.get("cancel") is True),
             "calibrate_focus": lambda r, c: self._calibrate_focus(),
+            "prepare_model": lambda r, c: self._prepare_model(),
         }
 
     def _legacy_verify(self) -> dict:
@@ -1148,18 +1155,46 @@ class FaceService:
             else:
                 log.info("embedding self-check skipped: no usable stored photo")
             log.info("model ready in %.1f s", time.perf_counter() - started)
-        except Exception:
+            self._model_error = None
+        except Exception as exc:
             log.exception("model warm-up failed")
+            lines = str(exc).strip().splitlines()
+            self._model_error = (lines[-1] if lines else type(exc).__name__)[:200]
+
+    def _prepare_model(self) -> dict:
+        """Try loading the models again (after a failed download, say), in the background."""
+        if self.recognizer.embedder.loaded:
+            return {"ok": True, "loaded": True}
+        if not self._preparing.acquire(blocking=False):
+            return {"ok": True, "started": False}  # already trying
+
+        def run() -> None:
+            try:
+                self._warm_model()
+                if self.cfg.anti_spoofing:
+                    self.recognizer.embedder.load_spoof_model()
+            finally:
+                self._preparing.release()
+
+        threading.Thread(target=run, name="prepare-model", daemon=True).start()
+        return {"ok": True, "started": True}
 
 
-def _single_instance() -> Any:
+def _single_instance(wait_s: float = 15.0, name: str = SERVICE_MUTEX) -> Any:
+    """The service's instance lock. One that is still shutting down (a quick stop
+    and start) is waited for, briefly, instead of being taken for a running one."""
     import win32api
     import win32event
     import winerror
-    mutex = win32event.CreateMutex(None, False, "Local\\FaceUnlockService")
-    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-        return None
-    return mutex
+    deadline = time.monotonic() + wait_s
+    while True:
+        mutex = win32event.CreateMutex(None, False, name)
+        if win32api.GetLastError() != winerror.ERROR_ALREADY_EXISTS:
+            return mutex
+        mutex.Close()
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.5)
 
 
 def main() -> None:
@@ -1169,7 +1204,7 @@ def main() -> None:
         log.warning("config: %s", problem)
     mutex = _single_instance()
     if mutex is None:
-        log.warning("another FaceService instance is already running; exiting")
+        log.warning("another FaceService instance is still running after 15 s; exiting")
         return
     watcher = SessionWatcher()
     service = FaceService(result.config, problems=result.problems, watcher=watcher)

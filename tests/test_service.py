@@ -204,6 +204,37 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("present", presence)
         self.assertIn("anti-spoofing-unavailable", self.service.status()["not_ready"])
 
+    def test_a_model_that_fails_to_load_is_reported_and_retried(self) -> None:
+        embedder = self.service.recognizer.embedder
+        embedder.loaded = False
+        embedder.load = lambda: (_ for _ in ()).throw(
+            RuntimeError("Download failed\nurl unreachable"))
+        self.service._warm_model()
+        status = self.service.status()
+        self.assertIn("model-unavailable", status["not_ready"])
+        self.assertEqual(status["recognition"]["model_error"], "url unreachable")
+        embedder.load = lambda: None  # the internet is back
+        self.assertTrue(self.service.handle({"cmd": "prepare_model"}, USER)["started"])
+        for _ in range(100):
+            if self.service._model_error is None:
+                break
+            time.sleep(0.02)
+        self.assertIsNone(self.service._model_error)
+
+    def test_a_quick_restart_waits_for_the_old_service_to_go(self) -> None:
+        import os
+        import threading
+
+        from face_service.service import _single_instance
+        name = f"Local\\FaceUnlockServiceTest-{os.getpid()}"  # not the real service's lock
+        held = _single_instance(name=name)
+        self.assertIsNotNone(held)
+        self.assertIsNone(_single_instance(wait_s=0.6, name=name))  # still running: give up
+        threading.Timer(0.5, held.Close).start()                    # the old one exits meanwhile
+        replacement = _single_instance(wait_s=5.0, name=name)
+        self.assertIsNotNone(replacement)
+        replacement.Close()
+
     def test_a_damaged_profile_does_not_stop_the_service(self) -> None:
         EMBED_PATH.write_bytes(b"")  # cut short by a power loss
         self.assertFalse(self.service.recognizer.load())
