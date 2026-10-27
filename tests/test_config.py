@@ -117,6 +117,8 @@ class ConfigRulesTests(unittest.TestCase):
         self.assertFalse(cfg.absence_learning)
         self.assertFalse(cfg.adaptive_lock)
         self.assertEqual(cfg.unlock_client_check, "enforce")  # only the sign-in screen
+        self.assertTrue(cfg.unlock_wait_after_manual_lock)
+        self.assertEqual(cfg.relock_unconfirmed_s, 120)
 
 
 if __name__ == "__main__":

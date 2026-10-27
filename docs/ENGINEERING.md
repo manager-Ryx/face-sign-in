@@ -43,6 +43,10 @@ From a full read plus an independent review. "Fixed" items have tests.
 | A presence check at start-up held the camera on for ~8 s while the model loaded | **Fixed** (camera users wait for the model first; tested) |
 | Four slightly different copies of the "write a state file safely" code | **Fixed** (one helper, `face_service/storage.py`, with fsync and temp-file clean-up) |
 | Settings edited outside the app could be overwritten by the tray's stale copy | **Fixed** (the tray watches `config.toml` and reloads; tested) |
+| A face recognised while walking past (screens off) left the PC unlocked and unattended until the hour-long auto-lock | **Fixed** (a face sign-in must be confirmed by a presence check after 30 s; otherwise the PC locks again after 2 min; tested) |
+| Windows+L while still facing the camera was undone about 3.6 s later | **Fixed** (after a lock of your own, face sign-in waits until you have stepped away, woken the screen or selected the tile; tested) |
+| Presence checks were skipped for 35 s after a sign-in, and the absence timer only started at the next 5-minute check | **Fixed** (the sign-in screen releases the camera as soon as you are signed in) |
+| The caller check and request log wrote one entry per lock-screen request (9,186 records and ~900 log lines an hour overnight) | **Fixed** (one caller record per lock, plus any other caller; per-request lines at debug level) |
 | Learning from frames of failed attempts | **Removed** (brief: failed attempts never train) |
 | Credential Provider: DLL could be unloaded while its worker ran; self-UnAdvise left the tile dead; registration errors ignored; CLSID duplicated as strings | **Fixed in source, compiled to `build-next`, not installed** (`credential_provider\update_provider.ps1`, with rollback) |
 | Pipe instance squatting by same-user processes | **Open** – needs a SYSTEM-owned service or client-side server verification in the tile |

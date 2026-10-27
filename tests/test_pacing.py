@@ -77,6 +77,18 @@ class PacingTests(unittest.TestCase):
         self.assertAlmostEqual(spent["active"], 65.0)
         self.assertEqual(pacer.take_mode_time(), {})
 
+    def test_after_an_automatic_lock_only_the_first_look_is_immediate(self) -> None:
+        clock = Clock()
+        pacer = LockScreenPacer(idle_after_s=lambda: 60.0, idle_interval_s=lambda: 10.0,
+                                pause_when_display_off=lambda: True, clock=clock,
+                                start_window_s=lambda: 0.0)
+        ticket = pacer.begin()
+        self.assertEqual(pacer.wait_turn(ticket), "go")
+        pacer.end(face_seen=False)
+        clock.now += 5
+        pacer.begin()
+        self.assertEqual(pacer.mode, "idle")
+
     def test_display_off_means_no_scanning(self) -> None:
         clock = Clock()
         display = ["off"]

@@ -69,14 +69,78 @@ class PresenceMonitorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.remote.stop()
 
-    def run_ticks(self, responses: list, times: list[float]):
+    def run_ticks(self, responses: list, times: list[float], *, after_unlock: bool = False):
+        """Run checks at ``times`` (seconds; after the unlock if ``after_unlock``)."""
         replies = iter(responses)
-        with patch("presence_monitor.monitor.pipe_call", side_effect=lambda *a, **k: next(replies)), \
+        self.sent: list[str] = []
+
+        def service(request: dict, *args, **kwargs):
+            self.sent.append(request["cmd"])
+            return next(replies) if request["cmd"] == "presence" else {"ok": True}
+
+        start = self.wall.now
+        with patch("presence_monitor.monitor.pipe_call", side_effect=service), \
                 patch("presence_monitor.monitor._lock_workstation") as lock:
             for second in times:
                 self.clock.now = second
+                if after_unlock:
+                    self.wall.now = start + second
                 self.monitor._tick()
         return lock
+
+    # ---- after a face sign-in -------------------------------------------------
+
+    CONFIRM_TIMES = [0, 15, 30, 45, 60, 75, 90, 105, 120]
+
+    def face_sign_in(self) -> tuple[dict, dict]:
+        """Unlock now; returns (absent, present) replies that report this face sign-in."""
+        self.monitor.on_session_event("unlock", {})
+        signed_in = {"face_sign_in_at": self.wall.now}
+        return dict(ABSENT, **signed_in), dict(PRESENT, **signed_in)
+
+    def test_walking_past_after_a_face_sign_in_locks_again_soon(self) -> None:
+        away, _ = self.face_sign_in()
+        lock = self.run_ticks([away] * 9, self.CONFIRM_TIMES, after_unlock=True)
+        lock.assert_called_once_with()
+        self.assertIn("auto_lock", self.sent)  # the service hears the lock wasn't yours
+        self.assertFalse(self.monitor.snapshot()["confirming"])
+
+    def test_staying_at_the_pc_confirms_the_sign_in(self) -> None:
+        away, here = self.face_sign_in()
+        lock = self.run_ticks([away, away, here] + [away] * 6, self.CONFIRM_TIMES,
+                              after_unlock=True)
+        lock.assert_not_called()
+
+    def test_being_seen_only_in_the_first_seconds_does_not_count(self) -> None:
+        away, here = self.face_sign_in()
+        lock = self.run_ticks([here, here] + [away] * 7, self.CONFIRM_TIMES, after_unlock=True)
+        lock.assert_called_once_with()
+
+    def test_a_password_or_pin_sign_in_is_not_second_guessed(self) -> None:
+        self.monitor.on_session_event("unlock", {})
+        lock = self.run_ticks([ABSENT] * 9, self.CONFIRM_TIMES, after_unlock=True)
+        lock.assert_not_called()
+        self.assertFalse(self.monitor.snapshot()["confirming"])
+
+    def test_failed_checks_never_lock_after_a_sign_in(self) -> None:
+        self.face_sign_in()
+        lock = self.run_ticks([None] * 9, self.CONFIRM_TIMES, after_unlock=True)
+        lock.assert_not_called()
+
+    def test_signed_straight_back_in_after_a_re_lock_is_trusted(self) -> None:
+        away, _ = self.face_sign_in()
+        self.run_ticks([away] * 9, self.CONFIRM_TIMES, after_unlock=True)
+        self.wall.now += 60
+        away, _ = self.face_sign_in()
+        lock = self.run_ticks([away] * 9, self.CONFIRM_TIMES, after_unlock=True)
+        lock.assert_not_called()
+
+    def test_re_locking_can_be_turned_off(self) -> None:
+        self.monitor.cfg = Config(presence_interval_s=120, presence_absence_timeout_s=600,
+                                  relock_unconfirmed_s=0)
+        away, _ = self.face_sign_in()
+        lock = self.run_ticks([away] * 9, self.CONFIRM_TIMES, after_unlock=True)
+        lock.assert_not_called()
 
     def test_120_second_checks_lock_once_at_ten_minutes(self) -> None:
         lock = self.run_ticks([PRESENT] + [ABSENT] * 5, [0, 120, 240, 360, 480, 600])

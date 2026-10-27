@@ -31,6 +31,7 @@ unlock_idle_interval_s = 10.0   # seconds between quick looks otherwise
 unlock_learn_routine = true     # scan continuously when you usually come back (counts only)
 unlock_pause_when_display_off = true
 unlock_client_check = "enforce" # only the sign-in screen may request the password ("log" records others)
+unlock_wait_after_manual_lock = true  # after Windows+L, wait until you have stepped away
 
 # --- Learning ----------------------------------------------------------------
 # Learns only from face sign-ins Windows confirmed; stores face signatures,
@@ -55,6 +56,7 @@ presence_absence_timeout_s = 3600   # lock after about an hour away
 presence_absent_strikes = 2     # legacy; used only when the timeout is 0
 presence_mode = "recognition"   # or "detection" (any face counts)
 presence_pause_while_locked = true
+relock_unconfirmed_s = 120      # after a face sign-in, lock again if you are not seen (0 = off)
 absence_learning = false        # optional away-time statistics (counts only)
 adaptive_lock = false           # optional shorter timeout when usually gone for hours
 adaptive_lock_min_timeout_s = 900

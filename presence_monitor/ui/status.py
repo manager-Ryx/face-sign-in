@@ -39,6 +39,7 @@ REASONS = {
     "not-enrolled": "Not set up", "no-credentials": "No stored password",
     "caller-not-allowed": "Blocked caller", "stopped": "Service stopped", "error": "Error",
     "timeout": "Took too long", "preempted": "Interrupted", "starting": "Still starting",
+    "just-locked": "Locked by you – waits until you step away",
 }
 
 

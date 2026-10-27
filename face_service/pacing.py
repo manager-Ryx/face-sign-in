@@ -41,11 +41,14 @@ class LockScreenPacer:
                  pause_when_display_off: Callable[[], bool],
                  display_state: Callable[[], str | None] = lambda: None,
                  clock: Callable[[], float] = time.monotonic,
-                 likely_back: Callable[[], bool] = lambda: False):
+                 likely_back: Callable[[], bool] = lambda: False,
+                 start_window_s: Callable[[], float] | None = None):
         """``idle_after_s`` is how long scanning stays continuous after the screen
-        locks or wakes, or a face is seen; ``likely_back`` (the learned routine)
-        keeps it continuous beyond that. Neither may call back into the pacer."""
+        wakes or a face is seen; ``start_window_s`` (default: the same) after the
+        lock screen appears; ``likely_back`` (the learned routine) keeps it
+        continuous beyond that. None of them may call back into the pacer."""
         self._idle_after_s = idle_after_s
+        self._start_window_s = start_window_s or idle_after_s
         self._idle_interval_s = idle_interval_s
         self._pause_when_display_off = pause_when_display_off
         self._display_state = display_state
@@ -99,8 +102,11 @@ class LockScreenPacer:
                 # Time between requests, attributed to the mode in force before.
                 self._mode_time[self._last_mode] = (self._mode_time.get(self._last_mode, 0.0)
                                                     + now - self._last_request)
-            if session_started or interactive:
-                # A fresh lock screen or an explicit re-arm: scan right away.
+            if session_started:
+                # A fresh lock screen: the first look happens right away.
+                self._active_until = now + self._start_window_s()
+            elif interactive:
+                # An explicit re-arm (tile click or Enter): scan right away.
                 self._active_until = now + self._idle_after_s()
             self._generation += 1
             self._in_flight += 1

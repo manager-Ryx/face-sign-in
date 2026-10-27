@@ -161,6 +161,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_lock_session_outcomes_are_recorded(self) -> None:
         self.watcher.emit("lock")
+        self.step_away()
         attempt = self.unlock([ME])["attempt_id"]
         self.service.handle({"cmd": "unlock_result", "attempt_id": attempt, "accepted": True},
                             SYSTEM)
@@ -189,10 +190,16 @@ class ServiceTests(unittest.TestCase):
 
     # ---- routine ---------------------------------------------------------------
 
+    def step_away(self) -> None:
+        """A look that finds nobody: after your own lock, face sign-in is ready again."""
+        self.assertEqual(self.unlock([NOBODY])["reason"], "no_face")
+        self.service.camera.release_now()  # a held camera would keep the empty scene
+
     def lock_and_return(self, minutes: float) -> None:
         wall = [time.time()]
         self.service._wall_clock = lambda: wall[0]
         self.watcher.emit("lock")
+        self.step_away()
         wall[0] += minutes * 60
         attempt = self.unlock([ME])["attempt_id"]
         self.service.handle({"cmd": "unlock_result", "attempt_id": attempt, "accepted": True},
@@ -236,6 +243,56 @@ class ServiceTests(unittest.TestCase):
         self.lock_and_return(10)
         self.assertTrue(self.service.handle({"cmd": "routine_reset"}, USER)["ok"])
         self.assertEqual(self.service.routine.summary()["locks"], 0)
+
+    # ---- locking and signing back in ---------------------------------------------
+
+    def test_after_you_lock_it_waits_until_you_step_away(self) -> None:
+        self.watcher.emit("lock")
+        response = self.unlock([ME])
+        self.assertEqual(response["reason"], "just-locked")
+        self.assertNotIn("password", response)
+        self.service.camera.release_now()
+        self.step_away()
+        self.assertTrue(self.unlock([ME])["ok"])
+
+    def test_waking_the_screen_signs_you_in_after_your_own_lock(self) -> None:
+        self.watcher.emit("lock")
+        self.assertEqual(self.unlock([ME])["reason"], "just-locked")
+        self.watcher.emit("display-on")
+        self.assertTrue(self.unlock([ME])["ok"])
+
+    def test_an_automatic_lock_welcomes_you_back_at_once(self) -> None:
+        self.service.handle({"cmd": "auto_lock", "away_s": 3600}, USER)
+        self.watcher.emit("lock")
+        self.assertEqual(self.service._start_window(), 0.0)  # no long scan: you left long ago
+        self.assertTrue(self.unlock([ME])["ok"])
+
+    def test_a_lock_reported_twice_stays_automatic(self) -> None:
+        self.service.handle({"cmd": "auto_lock", "away_s": 3600}, USER)
+        self.watcher.emit("lock")
+        self.watcher.emit("lock")
+        self.assertTrue(self.unlock([ME])["ok"])
+
+    def test_waiting_after_your_own_lock_can_be_turned_off(self) -> None:
+        self.service.cfg = Config(unlock_wait_after_manual_lock=False)
+        self.watcher.emit("lock")
+        self.assertTrue(self.unlock([ME])["ok"])
+
+    def test_presence_checks_resume_as_soon_as_you_are_signed_in(self) -> None:
+        attempt = self.unlock([ME])["attempt_id"]
+        self.service.handle({"cmd": "unlock_result", "attempt_id": attempt, "accepted": True},
+                            SYSTEM)
+        self.watcher.emit("unlock")
+        ScriptedCamera.script = [ME]
+        response = self.service.handle({"cmd": "presence"}, USER)
+        self.assertNotIn("skipped", response)
+        self.assertIsNotNone(response["face_sign_in_at"])
+
+    def test_the_sign_in_screen_is_recorded_once_per_lock(self) -> None:
+        self.watcher.emit("lock")
+        for _ in range(3):
+            self.unlock([NOBODY])
+        self.assertEqual(len(self.service.metrics.events({"unlock_caller"})), 1)
 
     # ---- presence ------------------------------------------------------------
 

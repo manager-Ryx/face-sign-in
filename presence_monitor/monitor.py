@@ -6,6 +6,12 @@ camera problem, no face profile, the camera lent to the setup window, a
 remote session – cancels the absence timer instead of counting towards it,
 so a fault can never cause a blind lock. Checks are skipped entirely while
 Windows is already locked; the sign-in screen has its own face scanning.
+
+After a face sign-in you also have to be seen at the PC a little later:
+checks run every 15 s, and if none from 30 s onwards finds you within
+``relock_unconfirmed_s`` (and at least three found you missing), the PC locks
+again. A face recognised while you only walked past therefore cannot leave
+the PC open for an hour.
 """
 from __future__ import annotations
 
@@ -25,6 +31,12 @@ from .absence import AbsenceModel
 from .remote_session import is_remote_context
 
 log = logging.getLogger(__name__)
+
+CONFIRM_AFTER_S = 30.0       # someone who sat down is still here by then; a passer-by is not
+CONFIRM_INTERVAL_S = 15.0
+CONFIRM_MIN_MISSES = 3
+RELOCK_TRUST_S = 180.0       # signed straight back in after such a re-lock: you were here
+SIGN_IN_MATCH_S = 30.0       # a face sign-in this close to the unlock caused it
 
 
 def _lock_workstation() -> None:
@@ -97,6 +109,9 @@ class PresenceMonitor:
         self._self_locked_at = 0.0
         self._timeout_rule = "Your normal lock timeout."
         self._state_lock = threading.Lock()
+        self._unlocked_at: float | None = None   # a sign-in still to be confirmed
+        self._confirm_misses = 0
+        self._relocked_at = float("-inf")
 
     # ---- control -----------------------------------------------------------
 
@@ -176,6 +191,7 @@ class PresenceMonitor:
             "last_guidance": last.guidance,
             "interval_s": self.cfg.presence_interval_s,
             "mode": self.cfg.presence_mode,
+            "confirming": self._confirm_active(),
         }
 
     def _set_last(self, result: str, reason: str = "", guidance: str = "") -> None:
@@ -198,6 +214,7 @@ class PresenceMonitor:
         learner = self._learning()
         if name == "lock":
             self._reset_absence()
+            self._end_confirmation()
             automatic = self._clock() - self._self_locked_at < 30
             if learner and not automatic:
                 learner.observe_lock()
@@ -205,11 +222,54 @@ class PresenceMonitor:
             self._reset_absence()
             if learner:
                 learner.observe_unlock()
+            if name == "unlock":
+                with self._state_lock:
+                    self._unlocked_at = self._clock()
+                    self._confirm_misses = 0
             self.check_soon()
         elif name in ("sleep", "remote-connect", "console-disconnect"):
             self._reset_absence()
             if learner and name != "sleep":
                 learner.discard_open(name)
+
+    # ---- confirming a face sign-in -------------------------------------------
+
+    def _confirm_active(self) -> bool:
+        with self._state_lock:
+            unlocked_at = self._unlocked_at
+        window = self.cfg.relock_unconfirmed_s
+        return (unlocked_at is not None and window > 0
+                and self._clock() - unlocked_at <= window + 3 * CONFIRM_INTERVAL_S)
+
+    def _end_confirmation(self) -> None:
+        with self._state_lock:
+            self._unlocked_at = None
+            self._confirm_misses = 0
+
+    def _confirming(self, response: dict) -> bool:
+        """Does this check count towards confirming the last sign-in?"""
+        with self._state_lock:
+            unlocked_at = self._unlocked_at
+        if unlocked_at is None:
+            return False
+        signed_in = response.get("face_sign_in_at")
+        by_face = (isinstance(signed_in, (int, float))
+                   and abs(unlocked_at - signed_in) <= SIGN_IN_MATCH_S)
+        if (not self._confirm_active() or not by_face
+                or unlocked_at - self._relocked_at < RELOCK_TRUST_S):
+            self._end_confirmation()  # not a face sign-in, or nothing left to confirm
+            return False
+        return self._clock() - unlocked_at >= CONFIRM_AFTER_S
+
+    def _lock(self, away_s: float, timeout: float, cause: str) -> None:
+        self._reset_absence()
+        self._lock_count += 1
+        self._self_locked_at = self._clock()
+        self.metrics.record("auto_lock", elapsed_s=round(away_s, 1), timeout_s=timeout,
+                            cause=cause)
+        # The lock is ours, not yours: the service may welcome you back at once.
+        pipe_call({"cmd": "auto_lock", "away_s": round(away_s, 1)}, timeout_s=2.0)
+        _lock_workstation()
 
     # ---- the check -----------------------------------------------------------
 
@@ -257,12 +317,16 @@ class PresenceMonitor:
 
         present = bool(response.get("present"))
         guidance = str(response.get("guidance") or "")
+        confirming = self._confirming(response)
         if present:
             self._strikes = 0
             self._absence.mark_present()
             if learner:
                 learner.observe_present()
             self._set_last("present", str(response.get("outcome", "match")))
+            if confirming:
+                log.info("face sign-in confirmed: you are at the PC")
+                self._end_confirmation()
             return
 
         self._strikes += 1
@@ -271,13 +335,21 @@ class PresenceMonitor:
         if learner:
             learner.observe_absent()
         self._set_last("absent", str(response.get("outcome", "")), guidance)
+        if confirming:
+            with self._state_lock:
+                self._confirm_misses += 1
+                misses, unlocked_at = self._confirm_misses, self._unlocked_at
+            since = self._clock() - (unlocked_at or self._clock())
+            if since >= self.cfg.relock_unconfirmed_s and misses >= CONFIRM_MIN_MISSES:
+                log.warning("signed in by face %.0f s ago but not seen at the PC since; "
+                            "locking again", since)
+                self._end_confirmation()
+                self._relocked_at = self._clock()
+                self._lock(since, self.cfg.relock_unconfirmed_s, "not-seen-after-sign-in")
+                return
         if elapsed >= timeout:
             log.warning("no face for about %.0f min; locking the workstation", elapsed / 60)
-            self._reset_absence()
-            self._lock_count += 1
-            self._self_locked_at = self._clock()
-            self.metrics.record("auto_lock", elapsed_s=round(elapsed, 1), timeout_s=timeout)
-            _lock_workstation()
+            self._lock(elapsed, timeout, "away")
 
     def run(self) -> None:
         log.info("presence checks every %ss; lock after about %ss; mode=%s",
@@ -292,7 +364,8 @@ class PresenceMonitor:
                 self._reset_absence()
                 self._set_last("error", "exception")
             # A fixed cadence: slow checks never cause a catch-up burst.
-            interval = float(self.cfg.presence_interval_s)
+            interval = (CONFIRM_INTERVAL_S if self._confirm_active()
+                        else float(self.cfg.presence_interval_s))
             next_at += interval
             now = time.monotonic()
             if next_at <= now:

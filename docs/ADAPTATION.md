@@ -123,9 +123,19 @@ you turn it on), **Recommend-only** (suggests; you decide).
   until your routine is known, then 2 minutes – and whenever the learned
   routine says you are likely to be back soon. Pressing a key or clicking the
   tile always scans at once. With *Keep the camera off while the screen is off*
-  on, nothing is scanned until the display wakes.
+  on, nothing is scanned until the display wakes. After an automatic lock
+  (you had already been away for the lock timeout) there is one look at once
+  and then quick looks, not a long continuous scan.
+- **Locking means locking (Safeguard; `unlock_wait_after_manual_lock`).**
+  After you lock the PC yourself – Windows+L, *Lock now* – face sign-in waits
+  until a look finds nobody (you stepped away), you wake the screen, or you
+  select the Face Unlock tile. Before this, pressing Windows+L while still
+  facing the camera signed you straight back in about 3.6 s later (seen live
+  on 26 and 27 Oct). Locks made by the presence monitor because you were away
+  are announced to the service and stay instantly unlockable.
 - **Routine learning (Active; *Learn when I usually come back*).** Each lock,
-  from locking to signing in again, is folded into counts: returns and locked
+  from locking (for an automatic lock: from when you were last seen) to
+  signing in again, is folded into counts: returns and locked
   hours per band of time since locking (first six hours; separately for
   weekday/weekend nights, mornings, afternoons and evenings, by when you
   locked) and per half hour of a weekday or weekend day. No list of lock
@@ -155,7 +165,20 @@ you turn it on), **Recommend-only** (suggests; you decide).
 Checks are skipped while Windows is locked (the tile already looks for you),
 during remote sessions, while the camera is lent to setup, and while paused.
 Skipped or failed checks reset the absence timer: they never count as you
-being away. Unlocking restarts the absence window.
+being away. Unlocking restarts the absence window, and the sign-in screen
+hands the camera back the moment you are signed in.
+
+**Making sure you stayed (Safeguard; `relock_unconfirmed_s`, default 2
+minutes).** After a face sign-in, checks run every 15 s. Only checks from 30 s
+onwards count – someone who sat down is still there, someone walking past is
+not. If none of them finds you within the window, and at least three found
+you missing, the PC locks again. Failed or skipped checks never count;
+password and PIN sign-ins are not second-guessed; and if you are signed
+straight back in within 3 minutes of such a re-lock, you are trusted to be
+there. Measured problem: on 27 Oct a quick look recognised the user walking
+past with the screens switched off at the monitor; presence checks at 5, 10
+and 15 minutes found nobody, and the PC would have stayed unlocked for about
+an hour. Now it would lock again after about 2 minutes.
 
 ## 8. Away-time patterns – Optional (off)
 
@@ -211,6 +234,7 @@ Generated from the code (`face_service/config.py`).
 | `unlock_learn_routine` | You decide | `True` |  | Learn when you usually come back to a locked PC and scan continuously then (uses only lock and sign-in times, kept as counts on this PC). |
 | `unlock_pause_when_display_off` | You decide | `True` |  | Stop using the camera while the screen is off on the lock screen. |
 | `unlock_client_check` | Safeguard (never changes silently) | `enforce` | off, log, enforce | Only the Windows sign-in screen may request your credentials ('enforce'); 'log' lets other programs ask but records them; 'off' skips the check. |
+| `unlock_wait_after_manual_lock` | Safeguard (never changes silently) | `True` |  | After you lock the PC yourself, face sign-in waits until you have stepped out of view, woken the screen or selected the Face Unlock tile. |
 | `adaptive_enrollment` | You decide | `False` |  | Learn your current appearance from confirmed face sign-ins. |
 | `adaptive_samples_per_unlock` | Safeguard (never changes silently) | `1` | 0-2 | Most face samples learned from one confirmed sign-in. |
 | `adaptive_max_embeddings` | You decide | `300` | 1-2000 | Most learned samples kept, in addition to your original enrollment. |
@@ -229,6 +253,7 @@ Generated from the code (`face_service/config.py`).
 | `presence_absent_strikes` | You decide | `2` | 1-100 | Legacy: consecutive absent checks before locking, used only when the timeout is 0. |
 | `presence_mode` | You decide | `recognition` | recognition, detection | 'recognition' requires your face; 'detection' accepts any face. |
 | `presence_pause_while_locked` | You decide | `True` |  | Skip presence checks while Windows is locked. |
+| `relock_unconfirmed_s` | Safeguard (never changes silently) | `120` | 0-600 | After a face sign-in, lock again if you are not seen at the PC within this many seconds, for example when you only walked past (0 turns this off). |
 | `absence_learning` | You decide | `False` |  | Keep approximate, local away-time statistics to suggest a lock timeout. |
 | `adaptive_lock` | You decide | `False` |  | Use a shorter lock timeout at times when you are usually away for hours. |
 | `adaptive_lock_min_timeout_s` | You decide | `900` | 300-86400 | Shortest lock timeout adaptive locking may use. |

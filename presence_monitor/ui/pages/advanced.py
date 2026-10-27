@@ -90,6 +90,21 @@ class AdvancedPage(Page):
                              b.choice("unlock_client_check",
                                       [("Record other callers", "log"),
                                        ("Only the sign-in screen", "enforce"), ("Off", "off")])))
+        group.add(SettingRow(G.LOCK, "Don't sign me straight back in after I lock",
+                             "After you lock the PC yourself (for example with Windows+L), face "
+                             "sign-in waits until you've stepped out of view. Waking the screen "
+                             "or selecting the Face Unlock tile signs you in at once.",
+                             b.toggle("unlock_wait_after_manual_lock")))
+        group.add(SettingRow(G.PERSON, "If I don't stay after a face sign-in",
+                             "For example when the camera recognised you walking past. Works "
+                             "while \"Lock my PC when I'm away\" is on.",
+                             b.choice("relock_unconfirmed_s",
+                                      [("Lock again after 1 minute", 60),
+                                       ("Lock again after 2 minutes", 120),
+                                       ("Lock again after 5 minutes", 300),
+                                       ("Don't lock again", 0)],
+                                      lambda s: f"Lock again after {s} seconds" if s
+                                      else "Don't lock again")))
 
         self.section("Data and maintenance")
         group = self.add(SettingsGroup())

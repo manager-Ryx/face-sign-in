@@ -19,7 +19,9 @@ when you walk away. Everything runs locally; nothing is uploaded.
 - **Ready when you come back.** The sign-in screen learns when you usually
   return (from lock and sign-in times only, kept as counts) and scans
   continuously then, so you're signed in as you sit down; the rest of the time
-  it takes a quick look every few seconds with the camera off in between.
+  it takes a quick look every few seconds with the camera off in between. If
+  it only caught you walking past, the PC locks again after two minutes; after
+  you press Windows+L it waits until you've actually left.
 - **Auto-lock when you leave.** A brief camera check every few minutes; after
   you have been away for the time you chose (one hour by default) Windows
   locks. Apps keep running. Checks pause while Windows is already locked.

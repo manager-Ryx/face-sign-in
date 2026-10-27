@@ -211,6 +211,13 @@ class LearningTransactionTests(unittest.TestCase):
         frames = [frame(Outcome.MATCH, 0.2, quality=DARK, embedding=direction(20))]
         self.assertIsNone(self.recognizer.stage_learning(frames))
 
+    def test_a_sign_in_with_nothing_to_learn_says_why(self) -> None:
+        frames = [frame(Outcome.MATCH, 0.2, quality=DARK, embedding=direction(20))]
+        self.assertIsNone(self.recognizer.stage_learning(frames, attempt_id="dark"))
+        result = self.recognizer.finish_learning("dark", True)
+        self.assertEqual(result.added, 0)
+        self.assertTrue(result.reason.startswith("nothing to learn"), result.reason)
+
     def test_learning_disabled_stages_nothing(self) -> None:
         self.cfg.adaptive_enrollment = False
         self.assertIsNone(self.recognizer.stage_learning(self.success(20)))

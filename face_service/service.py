@@ -14,7 +14,8 @@ Commands used by the tray app and tools:
   pause_camera / renew_camera / resume_camera   (camera hand-over leases),
   build_enrollment, profile_health, remove_anchors, map_anchor_files,
   learning_undo, learning_reset, threshold_apply, threshold_clear,
-  snapshot_restore, camera_list, clear_measurements, low_light_reset, routine_reset.
+  snapshot_restore, camera_list, clear_measurements, low_light_reset, routine_reset,
+  auto_lock (the presence monitor is about to lock because you are away).
 """
 from __future__ import annotations
 
@@ -85,6 +86,8 @@ CHECK_MODEL_WAIT_S = 20.0
 QUIET_REASONS = frozenset({"no_face", "superseded", "display-off", "stopped", "preempted",
                            "starting"})
 PACING_REASONS = frozenset({"superseded", "display-off", "stopped", "starting"})
+QUIET_COMMANDS = frozenset({"ping", "status", "unlock"})  # unlock: one summary per lock instead
+AUTO_LOCK_NOTICE_S = 10.0   # a lock this soon after the presence monitor's notice is its own
 CAUGHT_TEXT = {"instant": "by face straight away", "quick-look": "by face on a quick look",
                "other": "another way"}
 
@@ -99,8 +102,10 @@ class _Attempt:
 @dataclass
 class _LockSession:
     started: float
-    started_wall: float
+    started_wall: float             # when you left: the lock, or earlier for an automatic lock
     inferred: bool = False          # the service started while the screen was already locked
+    automatic: bool = False         # locked by the presence monitor because you were away
+    armed: bool = True              # face sign-in allowed (after a manual lock: once you left)
     face_seen: bool = False
     face_accepted: bool = False
     attempts: int = 0
@@ -139,7 +144,7 @@ class FaceService:
             idle_interval_s=lambda: self.cfg.unlock_idle_interval_s,
             pause_when_display_off=lambda: self.cfg.unlock_pause_when_display_off,
             display_state=lambda: self.watcher.display if self.watcher else None,
-            clock=clock, likely_back=self._likely_back)
+            clock=clock, likely_back=self._likely_back, start_window_s=self._start_window)
         self.detector = FaceDetector()
         self.server: PipeServer | None = None
         self._unlock_priority_until = 0.0
@@ -147,6 +152,9 @@ class FaceService:
         self._attempts_lock = threading.Lock()
         self._lock_session: _LockSession | None = None
         self._session_lock = threading.Lock()
+        self._auto_lock_notice: tuple[float, float] | None = None  # (when, seconds away)
+        self._face_sign_in_at: float | None = None                 # wall clock
+        self._caller_seen: tuple[str | None, bool] | None = None
         self._device_status: tuple[float, dict] | None = None
         self._ready_reason = "starting"
         self._warm = threading.Event()
@@ -161,14 +169,41 @@ class FaceService:
         self.metrics.record("session_event", event=name, **{k: v for k, v in detail.items()
                                                             if isinstance(v, (str, int))})
         if name.startswith("display-"):
-            self.pacer.display_changed(name.split("-", 1)[1])
+            state = name.split("-", 1)[1]
+            if state == "on":
+                self._arm("woke the screen")
+            self.pacer.display_changed(state)
         elif name == "lock":
-            with self._session_lock:
-                self._lock_session = _LockSession(self._clock(), self._wall_clock())
+            self._open_lock_session()
             self.pacer.take_mode_time()  # start this lock's camera-time tally afresh
             self.camera.release_now()
         elif name == "unlock":
+            self._unlock_priority_until = 0.0  # the sign-in screen is gone: camera is free
             self._close_lock_session()
+
+    def _open_lock_session(self) -> None:
+        now, wall = self._clock(), self._wall_clock()
+        current = self._lock_session
+        if current is not None and not current.inferred and now - current.started < 5.0:
+            return  # the same lock reported twice
+        notice, self._auto_lock_notice = self._auto_lock_notice, None
+        automatic = notice is not None and now - notice[0] <= AUTO_LOCK_NOTICE_S
+        session = _LockSession(now, wall - (notice[1] if automatic and notice else 0.0),
+                               automatic=automatic,
+                               armed=automatic or not self.cfg.unlock_wait_after_manual_lock)
+        with self._session_lock:
+            self._lock_session = session
+            self._caller_seen = None
+        if not session.armed:
+            log.info("locked by you: face sign-in waits until you have stepped away")
+
+    def _arm(self, why: str) -> None:
+        with self._session_lock:
+            session = self._lock_session
+            if session is None or session.armed:
+                return
+            session.armed = True
+        log.info("face sign-in ready again: you %s", why)
 
     def _close_lock_session(self) -> None:
         with self._session_lock:
@@ -219,7 +254,7 @@ class FaceService:
                 session.face_seen = True
                 if session.first_face_at is None:
                     session.first_face_at = looked_at if looked_at is not None else self._clock()
-                if verdict.accepted and session.accepted_at is None:
+                if reason == "match" and session.accepted_at is None:
                     session.accepted_at = self._clock()
                     session.accepted_mode = mode
 
@@ -242,6 +277,14 @@ class FaceService:
         if self._routine_in_use():
             return min(EAGER_WINDOW_S, self.cfg.unlock_idle_after_s)
         return self.cfg.unlock_idle_after_s
+
+    def _start_window(self) -> float:
+        """Continuous scanning when the lock screen appears. None after an automatic
+        lock: by then you have already been away for a while."""
+        session = self._lock_session
+        if session is not None and session.automatic:
+            return 0.0
+        return self._eager_window()
 
     def _likely_back(self) -> bool:
         """The learned routine says you're probably back soon: keep scanning."""
@@ -271,8 +314,12 @@ class FaceService:
         mode = self.cfg.unlock_client_check
         if mode == "off":
             return True
-        self.metrics.record("unlock_caller", system=client.is_system,
-                            identified=client.sid is not None)
+        identity = (client.sid, client.is_system)
+        with self._session_lock:
+            first, self._caller_seen = identity != self._caller_seen, identity
+        if first or not client.is_system:  # once per lock, and every other caller
+            self.metrics.record("unlock_caller", system=client.is_system,
+                                identified=client.sid is not None)
         if client.is_system:
             return True
         log.warning("credential request from a non-system caller (pid=%s)", client.pid)
@@ -403,10 +450,14 @@ class FaceService:
                 face_seen = any(f.outcome is not Outcome.NO_FACE for f in verdict.frames)
                 session.release_after = (0.0 if verdict.accepted or mode != "active"
                                          else self.camera.hold_seconds())
+            armed = self._armed_after_look(face_seen, ticket.interactive)
             reason = verdict.reason
             if not verdict.accepted:
                 return {"ok": False, "reason": verdict.reason, "guidance": verdict.issue,
                         "distance": round(verdict.best_distance, 4)}
+            if not armed:
+                reason = "just-locked"
+                return {"ok": False, "reason": "just-locked"}
             credential = load_password()
             if not credential:
                 reason = "no-credentials"
@@ -428,11 +479,26 @@ class FaceService:
         finally:
             self.pacer.end(face_seen=face_seen)
             self._note_attempt(verdict, reason, mode, looked_at)
-            if face_seen or reason not in QUIET_REASONS:
+            quiet = reason == "just-locked" or (reason in QUIET_REASONS and not face_seen)
+            if not quiet:
                 self._record_attempt("unlock_attempt", verdict, reason=reason,
                                      session=session_ref,
                                      extra={"mode": mode, "caller_system": client.is_system,
                                             "interactive": ticket.interactive})
+
+    def _armed_after_look(self, face_seen: bool, interactive: bool) -> bool:
+        """May this look sign you in? After you lock the PC yourself, not until a
+        look finds nobody there (you stepped away) or you select the tile."""
+        with self._session_lock:
+            session = self._lock_session
+            if session is None or session.armed:
+                return True
+            if face_seen and not interactive:
+                return False
+            session.armed = True
+        log.info("face sign-in ready again: %s",
+                 "you selected the tile" if interactive else "you stepped away")
+        return True
 
     def _remember_attempt(self, attempt_id: str, verdict: Verdict) -> None:
         # Keep one spare matching frame (not the learned one) as evaluation data.
@@ -456,6 +522,7 @@ class FaceService:
             log.info("unlock result for an unknown, expired, or repeated attempt ignored")
             return {"ok": True, "added": 0}
         if accepted:
+            self._face_sign_in_at = self._wall_clock()
             with self._session_lock:
                 if self._lock_session is not None:
                     self._lock_session.face_accepted = True
@@ -489,7 +556,8 @@ class FaceService:
                     present = self._detect_any_face(session)
                     self.metrics.record("presence_check", reason="face" if present
                                         else "no_face", mode=mode)
-                    return {"ok": True, "present": present, "mode": mode}
+                    return {"ok": True, "present": present, "mode": mode,
+                            "face_sign_in_at": self._face_sign_in_at}
                 verdict = self._verify(session, VerifyPolicy.for_presence(self.cfg))
                 if verdict.reason == "preempted":
                     return {"ok": True, "present": True, "skipped": "unlock-active", "mode": mode}
@@ -503,7 +571,8 @@ class FaceService:
         except CameraError as exc:
             return {"ok": False, "reason": f"camera-{exc.kind}", "message": str(exc)}
         return {"ok": True, "present": verdict.accepted, "mode": mode, "outcome": verdict.reason,
-                "guidance": verdict.issue, "distance": round(verdict.best_distance, 4)}
+                "guidance": verdict.issue, "distance": round(verdict.best_distance, 4),
+                "face_sign_in_at": self._face_sign_in_at}
 
     def _detect_any_face(self, session: CameraSession) -> bool:
         frame = session.first_frame
@@ -646,7 +715,10 @@ class FaceService:
                             "locked": self.watcher.locked if self.watcher else None,
                             "routine": ("off" if not self.cfg.unlock_learn_routine
                                         else "in-use" if self._routine_in_use()
-                                        else "learning")},
+                                        else "learning"),
+                            "waiting_for_you_to_leave": bool(
+                                self._lock_session and not self._lock_session.armed)},
+            "last_face_sign_in": self._face_sign_in_at,
         }
 
     def insights(self, days: float = 30.0) -> dict:
@@ -657,8 +729,7 @@ class FaceService:
 
     def handle(self, request: dict, client: ClientInfo) -> dict:
         cmd = request.get("cmd")
-        if cmd not in ("ping", "status"):
-            log.info("request cmd=%s", cmd)
+        log.log(logging.DEBUG if cmd in QUIET_COMMANDS else logging.INFO, "request cmd=%s", cmd)
         handler = self._handlers().get(cmd)
         if handler is None:
             return {"ok": False, "reason": "unknown-command"}
@@ -699,6 +770,7 @@ class FaceService:
             "clear_measurements": lambda r, c: self._clear_measurements(),
             "low_light_reset": lambda r, c: self._low_light_reset(),
             "routine_reset": lambda r, c: self._routine_reset(),
+            "auto_lock": lambda r, c: self._expect_auto_lock(r.get("away_s")),
         }
 
     def _legacy_verify(self) -> dict:
@@ -823,6 +895,13 @@ class FaceService:
         self.camera_profile.reset()
         self.adaptation.note("camera", None, "re-measure",
                              "You asked the app to re-measure camera behaviour", by="you")
+        return {"ok": True}
+
+    def _expect_auto_lock(self, away_s: Any) -> dict:
+        """The presence monitor is about to lock because you are away: the next lock
+        is not yours, so face sign-in may welcome you back straight away."""
+        valid = isinstance(away_s, (int, float)) and 0 <= away_s <= 7 * 86400
+        self._auto_lock_notice = (self._clock(), float(away_s) if valid else 0.0)
         return {"ok": True}
 
     def _routine_reset(self) -> dict:

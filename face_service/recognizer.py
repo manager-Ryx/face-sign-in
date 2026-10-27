@@ -147,6 +147,7 @@ class Recognizer:
         self._lock = threading.RLock()
         self._profile: FaceProfile | None = None
         self._pending: dict[str, _Pending] = {}
+        self._skipped: dict[str, tuple[float, str]] = {}  # attempt -> (when, why nothing staged)
 
     # ---- profile -----------------------------------------------------------
 
@@ -361,6 +362,7 @@ class Recognizer:
             if not dry_run:
                 self._install_locked(profile, persist=True)
                 self._pending.clear()
+                self._skipped.clear()
                 self.metrics.record("profile_built", mode=mode, accepted=report.accepted,
                                     rejected=report.rejected, anchors=report.anchors,
                                     learned=report.learned, consistency=consistency)
@@ -449,16 +451,26 @@ class Recognizer:
         while len(self._pending) >= MAX_PENDING:
             oldest = min(self._pending, key=lambda key: self._pending[key].created)
             self._pending.pop(oldest, None)
+        for attempt, (created, _why) in list(self._skipped.items()):
+            if created < cutoff or len(self._skipped) > MAX_PENDING:
+                self._skipped.pop(attempt, None)
+
+    def _skip(self, attempt_id: str | None, why: str) -> None:
+        """Remember why nothing was staged, so the sign-in result can say so."""
+        if attempt_id is not None:
+            with self._lock:
+                self._prune_pending_locked()
+                self._skipped[attempt_id] = (self._monotonic(), why)
 
     def stage_learning(self, analyses: list[FrameAnalysis], *,
                        attempt_id: str | None = None) -> str | None:
         """Pick the best safe frame of a successful attempt; nothing is saved yet."""
         cfg = self.cfg
         if not cfg.adaptive_enrollment or cfg.adaptive_samples_per_unlock <= 0:
-            return None
+            return self._skip(attempt_id, "learning is off")
         profile = self._profile
         if profile is None:
-            return None
+            return self._skip(attempt_id, "no face profile")
         candidates = [
             LearningCandidate(
                 a.embedding, a.quality.score() if a.quality else 0.0,
@@ -471,7 +483,7 @@ class Recognizer:
             reasons = [c.rejected for c in candidates if c.rejected]
             reason = max(set(reasons), key=reasons.count) if reasons else "no matching frame"
             self.metrics.record("learning_skipped", reason=reason, frames=len(candidates))
-            return None
+            return self._skip(attempt_id, reason)
         with self._lock:
             self._prune_pending_locked()
             attempt = attempt_id or secrets.token_urlsafe(18)
@@ -511,9 +523,11 @@ class Recognizer:
             self._prune_pending_locked()
             pending = self._pending.pop(attempt, None)
             if pending is None:
-                self.metrics.record("learning_result", accepted=accepted, added=0,
-                                    reason="unknown, late, or repeated report")
-                return LearnResult(0, "unknown, late, or repeated report")
+                skipped = self._skipped.pop(attempt, None)
+                why = (f"nothing to learn: {skipped[1]}" if skipped
+                       else "unknown, late, or repeated report")
+                self.metrics.record("learning_result", accepted=accepted, added=0, reason=why)
+                return LearnResult(0, why)
             if not accepted:
                 self.metrics.record("learning_result", accepted=False, added=0,
                                     reason="Windows did not accept the sign-in")
@@ -606,6 +620,7 @@ class Recognizer:
             for photo in LEARNED_PHOTOS_DIR.glob("sample-*.jpg"):
                 photo.unlink(missing_ok=True)
             self._pending.clear()
+            self._skipped.clear()
             return removed
 
     def learned_samples(self, limit: int = 50) -> list[dict]:

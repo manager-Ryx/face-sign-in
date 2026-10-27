@@ -157,6 +157,9 @@ class Config:
         "enforce", S, "Only the Windows sign-in screen may request your credentials "
         "('enforce'); 'log' lets other programs ask but records them; 'off' skips the check.",
         choices=CLIENT_CHECK_MODES)
+    unlock_wait_after_manual_lock: bool = _setting(
+        True, S, "After you lock the PC yourself, face sign-in waits until you have stepped "
+        "out of view, woken the screen or selected the Face Unlock tile.")
 
     # --- learning ----------------------------------------------------------
     adaptive_enrollment: bool = _setting(
@@ -208,6 +211,10 @@ class Config:
         choices=PRESENCE_MODES)
     presence_pause_while_locked: bool = _setting(
         True, P, "Skip presence checks while Windows is locked.")
+    relock_unconfirmed_s: int = _setting(
+        120, S, "After a face sign-in, lock again if you are not seen at the PC within this "
+        "many seconds, for example when you only walked past (0 turns this off).",
+        minimum=0, maximum=600)
     absence_learning: bool = _setting(
         False, P, "Keep approximate, local away-time statistics to suggest a lock timeout.")
     adaptive_lock: bool = _setting(
