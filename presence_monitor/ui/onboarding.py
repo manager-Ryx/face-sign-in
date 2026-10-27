@@ -185,8 +185,12 @@ class OnboardingWizard(QDialog):
             self.stack.addWidget(page)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
-        controller.status_changed.connect(lambda _s: self._refresh())
+        controller.status_changed.connect(self._on_status)
+        self.finished.connect(lambda _code: controller.status_changed.disconnect(self._on_status))
         self._go(0)
+
+    def _on_status(self, _status: Any) -> None:
+        self._refresh()
 
     # ---- helpers ---------------------------------------------------------------------
 
@@ -554,18 +558,24 @@ class OnboardingWizard(QDialog):
         os.startfile("ms-settings:signinoptions")  # type: ignore[attr-defined]
 
     def _save_password(self) -> None:
+        """Checking with Windows can take seconds on work PCs: off the UI thread."""
         user, domain = windows_account()
         secret = self.secret.text()
         self.secret.clear()
-        ok, problem = store_windows_password(user, domain, secret)
-        if not ok:
-            self.banner.show_message("critical", "Not saved", problem)
-            return
-        self.banner.hide()
-        self.controller.client.request({"cmd": "reload_config"},
-                                       lambda _r: self.controller.client.refresh_status())
-        self.password_state.setText("✓ Your password is saved.")
-        QTimer.singleShot(1500, self.controller.client.refresh_status)
+        self.password_state.setText("Checking with Windows…")
+
+        def done(result) -> None:
+            ok, problem = result
+            if not ok:
+                self.password_state.setText("")
+                self.banner.show_message("critical", "Not saved", problem)
+                return
+            self.banner.hide()
+            self.password_state.setText("✓ Your password is saved.")
+            self.controller.client.refresh_status()
+
+        self._in_background("password", lambda: store_windows_password(user, domain, secret),
+                            done)
 
     def _enroll(self) -> None:
         from .enroll import EnrollWizard
