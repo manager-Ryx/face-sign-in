@@ -56,11 +56,19 @@ jobs:
         shell: powershell
         run: |
           $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^v\d+\.\d+\.\d+') { $tag = "v0.0.0-${{ github.run_number }}" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+') {
+            Write-Host "Not a release tag: keeping the version written in the source"
+            exit 0
+          }
           $ver = $tag.TrimStart('v')
           Write-Host "Stamping app + installer with version $ver"
-          (Get-Content face_service\_version.py) -replace '(__version__\s*=\s*")[^"]+(")', "`$1$ver`$2" | Set-Content face_service\_version.py
-          (Get-Content installer\installer.iss) -replace '(#define MyAppVersion ")[^"]+(")', "`$1$ver`$2" | Set-Content installer\installer.iss
+          # ${1}, not $1: "$1" followed by a version's first digit reads as group 10.
+          (Get-Content face_service\_version.py) -replace '(__version__\s*=\s*")[^"]+(")', "`${1}$ver`${2}" | Set-Content face_service\_version.py
+          (Get-Content installer\installer.iss) -replace '(#define MyAppVersion ")[^"]+(")', "`${1}$ver`${2}" | Set-Content installer\installer.iss
+          python -c "import face_service._version as v; assert v.__version__ == '$ver', v.__version__"
+          if (-not (Select-String -Path installer\installer.iss -SimpleMatch "#define MyAppVersion `"$ver`"")) {
+            throw "installer.iss was not stamped with $ver"
+          }
 
       - name: Pre-download model weights (photo protection; ArcFace downloads on first start)
         shell: powershell
