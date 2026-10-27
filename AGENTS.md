@@ -134,13 +134,17 @@ pages, and what to tell the person on each:
    tile, Windows asks for permission again. Virtual cameras (NVIDIA
    Broadcast, OBS) are never chosen. If several real cameras are listed, they
    pick the one in front of them.
+   A small **Is this you?** panel can turn the camera on briefly, so they can
+   see the right camera was picked (and switch if several are listed), with a
+   lighting meter.
 3. **Password:** their Windows *account* password, not their PIN. They type
    it here themselves. The app checks it with Windows, then encrypts it for
    their account only. The page shows which account it is: for a Microsoft
    account, its email. It has **Show password** and a **Forgot it?** link. If
    they don't know the password, see the next section.
 4. **Your face:** about a minute, looking at the camera and turning their head
-   slowly as shown. Good light on their face helps; a bright window behind
+   slowly as the little animated face shows (a soft click per photo; the
+   speaker button mutes it). Good light on their face helps; a bright window behind
    them makes it harder. If an angle won't register, they can press **Take
    photo now** or **Skip this angle**.
 5. **Preferences:** auto-lock and how long to wait, how eagerly the lock
@@ -249,6 +253,15 @@ everyone else, and the next update replaces them. If the person needs it
 working now and agrees, a repair is their call. Record exactly what you
 changed, and include it in the report.
 
+The quickest way to gather the details is **Copy diagnostics** (Face Unlock →
+Advanced → *Copy diagnostics for support*, or About and help, or the tray
+menu). It puts one plain-text report on the clipboard and saves it as a zip in
+Downloads: versions, the same checks as `check_install.ps1`, the service
+status, settings, a week's measurement summary and the last 300 lines of both
+logs. It never contains the password, face data or photos, and it masks the
+account name, email address, PC name and camera device path. The person
+presses the button; you may read the zip they saved.
+
 Open an issue at <https://github.com/manager-Ryx/face-sign-in/issues>. A good
 report has:
 
@@ -257,7 +270,8 @@ report has:
 - the output of `check_install.ps1`;
 - the error text or traceback;
 - the relevant lines of `%USERPROFILE%\.face-unlock\service.log` and
-  `presence.log`.
+  `presence.log` (or the Copy diagnostics report, which has all of the above
+  except the installer's SHA-256).
 
 The logs hold no images or passwords. Still, read them before sharing, and
 leave out anything the person considers private: their camera's name and

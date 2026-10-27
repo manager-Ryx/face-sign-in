@@ -38,7 +38,6 @@ for effort. "Done" items are listed at the end for reference.
 | Several Windows users on one PC | A profile and password per account; the tile shows for whoever is selected | Medium |
 | Face for app and admin prompts (CredUI) | Convenient, but a new attack surface: needs its own threat review | Large |
 | Bluetooth phone as a second factor | Combine with Windows Dynamic Lock for high-security users | Medium |
-| "Copy diagnostics" | One click zips logs and measurements (never images or the password) for support | Small |
 
 ## Tweaks to what exists
 
@@ -54,7 +53,8 @@ for effort. "Done" items are listed at the end for reference.
   an external webcam.
 - **Strictness**: suggest a stricter setting through a notification once the
   evidence is there, instead of only on the Learning page.
-- **Notifications** with buttons ("Update password", "Add to lock screen").
+- **Notifications** with real buttons ("Update password", "Add to lock screen")
+  through Windows toasts. Selecting a notification already opens its fix.
 
 ## Systems
 
@@ -69,12 +69,20 @@ for effort. "Done" items are listed at the end for reference.
 
 ## UI and onboarding polish
 
-- A short animation on the *Your face* step showing the head turns.
 - A lock-screen preview on the Overview: "this is what you'll see".
-- Screen-reader and keyboard-only pass over every screen; high-contrast test.
-- Sound or haptic cue when a photo is taken during setup.
+- Screen-reader and keyboard-only pass over every screen with a screen reader
+  running; high-contrast test. (Accessible names, tooltips and shortcuts are in.)
+- The animated guide `hello-only.webp` (a placeholder shows the steps until then).
 
 ## Done in this release
+
+UX pass (0.3.0-beta.3): a live "Is this you?" camera check in setup; a
+head-turn animation, shutter sound (with mute) and per-photo flash during
+face capture; a lighting meter in both; Copy diagnostics; a first face
+sign-in notice and a weekly summary; notifications that open their fix;
+busy buttons, in-place results, toasts with Undo, saved ticks,
+reset-to-default and search for settings, a step indicator, gentle fades
+(off when Windows' animation effects are off), and a remembered window size.
 
 First-run setup (consent, automatic readiness with fixes, password, face,
 preferences, try it); a bundled model is used offline; the tray restarts a

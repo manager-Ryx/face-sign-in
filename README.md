@@ -64,6 +64,24 @@ and says what's left to do.
 - **A Windows 11 style app** (Qt) with an overview, a guided face setup with a
   live preview, a recognition test, plain-English settings, and a *Learning
   and adaptation* page that shows what was learned, measured and changed.
+- **Friendly setup.** First-run setup shows a live "Is this you?" camera
+  check, so you can see the right webcam was picked (and switch). Face
+  capture shows which way to turn with a little animated face, flashes and
+  clicks softly for each photo (mute it with one click), and a lighting meter
+  says when it's a bit dark or too bright behind you.
+- **Feedback everywhere.** Buttons show when they're working ("Checking…"),
+  results appear right where you clicked, each saved setting gets a tick,
+  settings can be searched (Ctrl+F) and put back to their default, and
+  undoable actions offer **Undo**. The window remembers its size and place.
+- **Notifications that lead to the fix.** Select "Windows didn't accept your
+  saved password" and the password window opens; the same for adding face
+  sign-in to the lock screen and the Windows Hello-only setting. A cheerful
+  "Signed in by face in 0.8 s" after your first face sign-in, and at most a
+  weekly "saved you 12 PIN entries" (both follow the notifications setting).
+- **Copy diagnostics** (Advanced, About, or the tray menu): one report for
+  getting help, copied and saved as a zip in Downloads. Never your password,
+  face data or photos; your account name, email, PC name and camera path are
+  masked.
 
 ## How it fits together
 
@@ -109,7 +127,7 @@ asks a few preferences. See [INSTALL.md](INSTALL.md) and
 
 ```powershell
 .\.venv\Scripts\pip install -r requirements-dev.txt
-.\.venv\Scripts\python -m unittest discover -s tests     # 270+ tests, no camera needed
+.\.venv\Scripts\python -m unittest discover -s tests     # 300+ tests, no camera needed
 .\.venv\Scripts\ruff check .
 .\.venv\Scripts\python -m tools.ui_preview out\          # render every screen to PNG
 .\.venv\Scripts\python -m tools.bench 5                  # time recognition checks (camera)
