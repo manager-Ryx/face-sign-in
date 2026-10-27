@@ -47,6 +47,7 @@ from face_service.win_events import SessionWatcher
 from . import system_setup
 from .absence import AbsenceModel
 from .monitor import PresenceMonitor
+from .notices import Notice, Notices
 from .ui import theme
 from .ui.client import ServiceClient
 
@@ -57,6 +58,7 @@ APP_USER_MODEL_ID = "FaceUnlock.App"
 
 
 SYSTEM_CHECK_S = 30.0
+WEEKLY_CHECK_DELAY_MS = 90_000   # after a sign-in, once you've settled in
 WATCHDOG_MISSES = 2          # status checks without an answer before restarting the service
 WATCHDOG_GAP_S = 300.0       # at most one restart this often
 
@@ -99,6 +101,11 @@ class AppController(QObject):
         self.client.status_changed.connect(self._watchdog)
         self.session_event.connect(self._on_session_event)
         self.notice.connect(self._notify)
+        self.notices = Notices(STATE_DIR / "notices.json")
+        self.client.status_changed.connect(self._celebrate)
+        self._weekly_timer = QTimer(self)
+        self._weekly_timer.setSingleShot(True)
+        self._weekly_timer.timeout.connect(self._weekly_summary)
         hints = QGuiApplication.styleHints()
         hints.colorSchemeChanged.connect(self._on_system_scheme)
         # Settings edited outside the app (by hand or a tool) are picked up, so a
@@ -126,6 +133,7 @@ class AppController(QObject):
         self.client.set_polling(15000)
         self.client.refresh_status()
         QTimer.singleShot(1500, self._first_run)
+        self._weekly_timer.start(5 * 60_000)
         if self.cfg.check_for_updates:
             QTimer.singleShot(60_000, self.check_for_updates_quietly)
 
@@ -213,8 +221,12 @@ class AppController(QObject):
     def _tile_done(self, ok: bool, message: str) -> None:
         self._system = None
         if self.tray is not None:
-            self.tray.notify("Face sign-in added to the lock screen" if ok else
-                             "Face sign-in wasn't added", "" if ok else message)
+            if ok:
+                self.tray.notify("Face sign-in added to the lock screen",
+                                 "Try it: press Windows+L and look at your camera.")
+            else:
+                self.tray.notify("Face sign-in wasn't added", message + " Select to try again.",
+                                 "install-tile")
         self.client.refresh_status()
 
     def open_setup(self, mode: str = "append") -> None:
@@ -298,11 +310,89 @@ class AppController(QObject):
     def _on_session_event(self, name: str) -> None:
         if name == "lock" and self._wizard is not None and self._wizard.isVisible():
             self._wizard.pause_for_lock()
+        if name == "unlock":
+            self._weekly_timer.start(WEEKLY_CHECK_DELAY_MS)
 
     def capture_window_opened(self, wizard) -> None:
         """A face-capture window opened elsewhere (first-run setup): like the one
         from open_setup, it must give the camera back as soon as Windows locks."""
         self._wizard = wizard
+
+    # ---- fixes: one place for "do the thing that solves this" ----------------------
+
+    def _window(self):
+        self.show_main()
+        return self._main_window
+
+    def run_fix(self, action: str | None, parent=None, *, from_notification: bool = False) -> None:
+        """Open whatever fixes ``action`` (an Overview action), from a button or a
+        notification. Anything that asks Windows for permission is confirmed first
+        when it comes from a notification."""
+        from .ui import dialogs
+        if action in (None, "open"):
+            self.show_main()
+        elif action == "start-service":
+            self.start_service()
+        elif action == "setup":
+            if self.onboarding_done():
+                self.open_setup("replace")
+            else:
+                self.open_onboarding()
+        elif action == "install-tile":
+            parent = parent or self._window()
+            if not from_notification or dialogs.confirm(
+                    parent, "Add face sign-in to your lock screen?",
+                    "Windows will ask for your permission once. Your PIN and password keep "
+                    "working as before.", "Add it", destructive=False):
+                self.install_tile()
+        elif action == "hello-settings":
+            from .ui.guides import HelloOnlyGuide
+            HelloOnlyGuide(parent or self._window()).exec()
+            self.forget_system_state()
+            self.client.refresh_status()
+        elif action == "password":
+            dialogs.PasswordDialog(self, parent or self._window()).exec()
+            self.client.refresh_status()
+        elif action == "camera-moved":
+            dialogs.confirm_moved_camera(self, parent or self._window())
+        elif action in ("camera-settings", "settings"):
+            self.show_main("settings")
+        elif action == "prepare-model":
+            self.client.request({"cmd": "prepare_model"}, lambda _r: self.client.refresh_status())
+        elif action == "diagnostics":
+            self.open_diagnostics(parent)
+        else:
+            self.show_main()
+
+    def open_diagnostics(self, parent=None) -> None:
+        from .ui.dialogs import DiagnosticsDialog
+        DiagnosticsDialog(self, parent or self._window()).exec()
+
+    # ---- cheerful notices -------------------------------------------------------
+
+    def _celebrate(self, status: Any) -> None:
+        if not self.cfg.notifications or self.tray is None:
+            return
+        notice = self.notices.on_status(status, time.time())
+        if notice is not None:
+            self._show_notice(notice)
+
+    def _weekly_summary(self) -> None:
+        if not self.cfg.notifications or not self.notices.weekly_due(time.time()):
+            return
+
+        def counted(reply: Any) -> None:
+            count = ((reply or {}).get("reliability") or {}).get("face_sign_ins")
+            if isinstance(count, int):
+                notice = self.notices.weekly(count, time.time())
+                if notice is not None:
+                    self._show_notice(notice)
+
+        self.client.request({"cmd": "insights", "days": 7}, counted, timeout_s=20.0)
+
+    def _show_notice(self, notice: Notice) -> None:
+        if self.tray is not None:
+            self.tray.notify(notice.title, notice.message, "open")
 
     # ---- actions ---------------------------------------------------------------
 

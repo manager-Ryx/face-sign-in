@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QMenu, QVBoxLayout, QWidget
 
 from ..icons import G, GlyphLabel
@@ -12,11 +12,13 @@ from ..widgets import (
     Card,
     Page,
     Pill,
-    ProgressRing,
+    StatusLine,
     accent_button,
     button,
+    fade_in,
     hbox,
     label,
+    show_toast,
     subtle_button,
 )
 
@@ -44,7 +46,7 @@ class StatusTile(Card):
     def show_tile(self, tile: Tile) -> None:
         self.value.setText(tile.value)
         self.detail.setText(tile.detail)
-        self.pill.set_state(tile.pill, tile.tone if tile.tone != "accent" else "accent")
+        self.pill.set_state(tile.pill, tile.tone, tile.detail)
         self.pill.setVisible(bool(tile.pill))
         self.setAccessibleName(f"{tile.value}. {tile.detail}")
 
@@ -67,8 +69,18 @@ class HomePage(Page):
         text.addWidget(self.hero_message)
         row.addLayout(text, 1)
         self.hero_action = accent_button("", self._hero_action)
-        row.addWidget(self.hero_action, 0, Qt.AlignmentFlag.AlignVCenter)
+        # When something's wrong, a report for whoever helps is one click away.
+        self.hero_help = subtle_button("Copy diagnostics",
+                                       lambda: controller.run_fix("diagnostics", self))
+        self.hero_help.setToolTip("Copy a report for getting help (never your password, face "
+                                  "data or photos)")
+        buttons = QVBoxLayout()
+        buttons.setSpacing(4)
+        buttons.addWidget(self.hero_action)
+        buttons.addWidget(self.hero_help)
+        row.addLayout(buttons)
         hero.body.addLayout(row)
+        self._hero_title = ""
         self.add(hero)
         self._action: str | None = None
 
@@ -90,8 +102,13 @@ class HomePage(Page):
         self.section("Quick actions")
         actions = Card(padding=(16, 14))
         self.check_button = button("Check that I'm here", self._check_presence)
+        self.check_button.setToolTip("Looks for you with the camera now and restarts the "
+                                     "auto-lock timer")
         self.test_button = button("Test face recognition", lambda: controller.show_main("face"))
+        self.test_button.setToolTip("Shows how closely the camera image matches your face "
+                                    "(Your face page)")
         self.pause_button = button("Pause auto-lock")
+        self.pause_button.setToolTip("Stop locking when you step away, for a while")
         pause_menu = QMenu(self.pause_button)
         for text, seconds in (("For 15 minutes", 900), ("For 1 hour", 3600),
                               ("Until I resume", None)):
@@ -99,16 +116,11 @@ class HomePage(Page):
         self.pause_button.setMenu(pause_menu)
         self.resume_button = accent_button("Resume auto-lock", self._resume)
         self.lock_button = subtle_button("Lock now", controller.lock_now)
+        self.lock_button.setToolTip("Lock Windows straight away, like Windows+L")
         actions.body.addLayout(hbox(self.check_button, self.test_button, self.pause_button,
                                     self.resume_button, None, self.lock_button, stretch_at=5))
-        self.busy = ProgressRing(18)
-        self.busy.hide()
-        self.result = label("", "Secondary", wrap=True)
-        self.result_row = QWidget()
-        self.result_row.setObjectName("Transparent")
-        self.result_row.setLayout(hbox(self.busy, self.result, stretch_at=2))
-        self.result_row.hide()
-        actions.body.addWidget(self.result_row)
+        self.result = StatusLine()
+        actions.body.addWidget(self.result)
         self.add(actions)
 
         self.section("Good to know")
@@ -133,11 +145,18 @@ class HomePage(Page):
         glyph = {"success": G.DONE, "caution": G.WARNING, "critical": G.ERROR}.get(
             overview.tone, G.INFO)
         self.hero_icon.set_glyph(glyph, overview.tone)
+        if overview.title != self._hero_title:
+            if self._hero_title:
+                fade_in(self.hero_icon, 260)   # the state changed: let the eye notice
+            self._hero_title = overview.title
         self.hero_title.setText(overview.title)
         self.hero_message.setText(overview.message)
+        if overview.action != self._action:
+            self.hero_action.set_busy(False)
         self._action = overview.action
         self.hero_action.setVisible(bool(overview.action))
         self.hero_action.setText(overview.action_text or "")
+        self.hero_help.setVisible(overview.tone != "success")
         self.camera.show_tile(overview.camera)
         self.recognition.show_tile(overview.recognition)
         self.autolock.show_tile(overview.autolock)
@@ -146,61 +165,49 @@ class HomePage(Page):
         self.pause_button.setVisible(c.cfg.presence_enabled and not paused)
         self.resume_button.setVisible(paused)
         self.check_button.setEnabled(c.cfg.presence_enabled)
+        self.check_button.setToolTip(
+            "Looks for you with the camera now and restarts the auto-lock timer"
+            if c.cfg.presence_enabled else "Auto-lock is off in Settings, so there's nothing to "
+            "check")
 
     def _hero_action(self) -> None:
-        c = self.controller
-        if self._action == "start-service":
-            c.start_service()
-        elif self._action == "setup":
-            if c.onboarding_done():
-                c.open_setup("replace")
-            else:
-                c.open_onboarding()
-        elif self._action == "install-tile":
-            c.install_tile()
-        elif self._action == "hello-settings":
-            from ..guides import HelloOnlyGuide
-            HelloOnlyGuide(self).exec()
-            c.forget_system_state()
-            c.client.refresh_status()
-        elif self._action == "password":
-            from ..dialogs import PasswordDialog
-            PasswordDialog(c, self).exec()
-            c.client.refresh_status()
-        elif self._action == "camera-moved":
-            from ..dialogs import confirm_moved_camera
-            confirm_moved_camera(c, self)
-        elif self._action in ("camera-settings", "settings"):
-            c.show_main("settings")
-        elif self._action == "prepare-model":
-            c.client.request({"cmd": "prepare_model"}, lambda _r: c.client.refresh_status())
+        busy = {"start-service": "Starting…", "install-tile": "Waiting for Windows…",
+                "prepare-model": "Trying again…"}.get(self._action or "")
+        if busy:
+            self.hero_action.set_busy(True, busy)   # until the status changes...
+            QTimer.singleShot(45_000, lambda: self.hero_action.set_busy(False))  # ...or not
+        self.controller.run_fix(self._action, self)
 
     def _check_presence(self) -> None:
-        self.result_row.show()
-        self.busy.show()
-        self.result.setText("Looking for you…")
-        self.check_button.setEnabled(False)
+        self.result.working("Looking for you…")
+        self.check_button.set_busy(True, "Looking…")
 
         def done(reply) -> None:
-            self.busy.hide()
-            self.check_button.setEnabled(True)
+            self.check_button.set_busy(False)
             if reply is None:
-                self.result.setText("Face Unlock isn't responding right now.")
+                self.result.done("critical", "Face Unlock isn't responding right now. Try again "
+                                 "in a moment.")
             elif reply.get("skipped"):
-                self.result.setText("Skipped: the camera is busy with another task.")
+                self.result.done("info", "Skipped: the camera is busy with another task. Try "
+                                 "again in a moment.")
             elif reply.get("ok") and reply.get("present"):
-                self.result.setText("You're here. The auto-lock timer has restarted.")
+                self.result.done("success", "You're here. The auto-lock timer has restarted.")
                 self.controller.monitor.check_soon()
             else:
-                self.result.setText("Couldn't confirm it's you. " + guidance_text(
-                    reply.get("guidance") or reply.get("reason")))
+                self.result.done("caution", "Couldn't confirm it's you. " + (guidance_text(
+                    reply.get("guidance") or reply.get("reason")) or "Look at the camera and "
+                    "try again."))
 
         self.controller.check_presence_now(done)
 
     def _pause(self, seconds: float | None) -> None:
         self.controller.monitor.pause(seconds)
         self.refresh()
+        text = {900: "for 15 minutes", 3600: "for an hour"}.get(seconds or 0, "until you resume")
+        show_toast(self, f"Auto-lock paused {text}", "info",
+                   action=("Undo", self._resume), ms=6000)
 
     def _resume(self) -> None:
         self.controller.monitor.resume()
         self.refresh()
+        show_toast(self, "Auto-lock is back on")

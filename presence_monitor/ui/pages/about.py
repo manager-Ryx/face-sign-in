@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt
 from face_service._version import __version__
 
 from ..icons import G, GlyphLabel, app_icon
-from ..widgets import Card, Page, hbox, label
+from ..widgets import Card, Page, accent_button, button, hbox, label
 
 if TYPE_CHECKING:
     from ...app import AppController
@@ -39,6 +39,7 @@ PRIVACY = (
     "Windows so only your account on this PC can decrypt it. Measurements never contain images "
     "or face signatures."
 )
+ISSUES_URL = "https://github.com/manager-Ryx/face-sign-in/issues"
 CREDITS = (
     "Built on DeepFace (MIT) with the ArcFace recognition model, OpenCV and its YuNet face "
     "detector, Qt for Python (LGPL), and pywin32. Check the licences of the recognition model "
@@ -63,6 +64,18 @@ class AboutPage(Page):
         text.addLayout(column, 1)
         header.body.addLayout(text)
         self.add(header)
+
+        self.section("Get help")
+        help_card = Card(padding=(20, 16), spacing=10)
+        help_card.body.addWidget(label(
+            "Something not working? Copy diagnostics makes a report for whoever helps you "
+            "(it never includes your password, face data or photos), then describe what "
+            "happened in an issue on the project's page.", "Body2", wrap=True))
+        copy = accent_button("Copy diagnostics…", lambda: controller.run_fix("diagnostics", self))
+        report = button("Report a problem", self._open_issues)
+        report.setToolTip(ISSUES_URL)
+        help_card.body.addLayout(hbox(copy, report, stretch_at=2))
+        self.add(help_card)
 
         self.section("How it works")
         how = Card(padding=(20, 16), spacing=12)
@@ -94,3 +107,8 @@ class AboutPage(Page):
         credits_card.body.addWidget(label(CREDITS, "Body2", wrap=True))
         self.add(credits_card)
         self.finish()
+
+    @staticmethod
+    def _open_issues() -> None:
+        import os
+        os.startfile(ISSUES_URL)  # type: ignore[attr-defined]

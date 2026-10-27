@@ -14,12 +14,28 @@ if TYPE_CHECKING:
     from ..app import AppController
 
 
+# How a notification says what selecting it does.
+FIX_VERBS = {
+    "password": "store your new password",
+    "install-tile": "add it",
+    "hello-settings": "see how",
+    "setup": "set it up",
+    "camera-moved": "confirm it",
+    "camera-settings": "choose your camera",
+    "start-service": "open Face Unlock",
+    "prepare-model": "open Face Unlock",
+}
+
+
 class TrayController:
     def __init__(self, controller: AppController):
         self.controller = controller
         self.icon = QSystemTrayIcon(tray_icon("off"))
         self.icon.setToolTip("Face Unlock")
         self.icon.activated.connect(self._activated)
+        # Notifications can't have buttons, so selecting one opens its fix.
+        self._click_action: str | None = None
+        self.icon.messageClicked.connect(self._message_clicked)
         self.menu = QMenu()
         self._build_menu()
         self.icon.setContextMenu(self.menu)
@@ -59,6 +75,7 @@ class TrayController:
             self._action(G.SETTINGS, "Set up Face Unlock…", c.open_onboarding)
         self._action(G.ADD, "Add my current appearance…", lambda: c.open_setup("append"))
         self._action(G.SETTINGS, "Settings", lambda: c.show_main("settings"))
+        self._action(G.COPY, "Copy diagnostics for support…", lambda: c.run_fix("diagnostics"))
         self.menu.addSeparator()
         self._action(G.POWER, "Quit Face Unlock…", lambda: c.show_main("quit"))
         self.menu.aboutToShow.connect(lambda: self._update(c.client.status))
@@ -91,7 +108,9 @@ class TrayController:
         if c.cfg.notifications and previous is not None and overview.alert_key and \
                 overview.alert_key != previous.alert_key and overview.alert_key not in self._notified:
             self._notified.add(overview.alert_key)
-            self.notify(overview.title, overview.message)
+            self.notify(overview.title, overview.message + (
+                f" Select to {FIX_VERBS[overview.action]}." if overview.action in FIX_VERBS
+                else ""), overview.action)
         if overview.alert_key is None:
             self._notified.clear()
 
@@ -107,8 +126,14 @@ class TrayController:
             self.notify("Presence check", "Couldn't confirm it's you. "
                         + guidance_text(reply.get("guidance") or reply.get("reason")))
 
-    def notify(self, title: str, message: str) -> None:
-        """Desktop notification (results you asked for are always shown)."""
+    def notify(self, title: str, message: str, action: str | None = "open") -> None:
+        """Desktop notification (results you asked for are always shown); selecting it
+        runs ``action`` (see ``AppController.run_fix``)."""
         if self.controller.cfg.notifications or title == "Presence check":
+            self._click_action = action
             self.icon.showMessage(title, message, glyph_icon(G.FACE, theme.current().text, 32),
                                   6000)
+
+    def _message_clicked(self) -> None:
+        action, self._click_action = self._click_action, "open"
+        self.controller.run_fix(action, from_notification=True)

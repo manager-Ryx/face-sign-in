@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLineEdit,
+    QPlainTextEdit,
     QRadioButton,
     QScrollArea,
     QVBoxLayout,
@@ -29,6 +30,7 @@ from .widgets import (
     Banner,
     CapsLockWarning,
     ProgressRing,
+    StatusLine,
     accent_button,
     button,
     hbox,
@@ -215,6 +217,11 @@ class PasswordDialog(Dialog):
         self.show_box.toggled.connect(self._show)
         self.body.addWidget(self.password)
         self.body.addWidget(self.repeat)
+        # Gentle, as you type: only once the second box is as long as the first.
+        self.match = StatusLine()
+        self.body.addWidget(self.match)
+        self.password.textChanged.connect(self._typed)
+        self.repeat.textChanged.connect(self._typed)
         self.body.addWidget(CapsLockWarning(self.password, self.repeat))
         self.body.addLayout(hbox(self.show_box,
                                  subtle_button("Forgot it?",
@@ -227,7 +234,25 @@ class PasswordDialog(Dialog):
         self.add_buttons("Save", destructive=False)
         self.accept_button.clicked.disconnect()
         self.accept_button.clicked.connect(self._save)
+        self._typed()
         self.password.setFocus()
+
+    def _typed(self) -> None:
+        secret, again = self.password.text(), self.repeat.text()
+        if not secret or not again:
+            self.match.clear()
+            reason = "Type your password in both boxes"
+        elif len(again) < len(secret) and secret.startswith(again):
+            self.match.clear()   # still typing
+            reason = "Type it again in the second box"
+        elif secret == again:
+            self.match.done("success", "The passwords match.")
+            reason = ""
+        else:
+            self.match.done("caution", "The two passwords don't match yet.")
+            reason = "The two passwords don't match"
+        self.accept_button.setEnabled(not reason)
+        self.accept_button.setToolTip(reason)
 
     def _show(self, visible: bool) -> None:
         mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
@@ -236,13 +261,16 @@ class PasswordDialog(Dialog):
 
     def _save(self) -> None:
         secret, again = self.password.text(), self.repeat.text()
+        if not secret or self.accept_button.busy:
+            return  # nothing typed, or Windows is still checking the last one
         if secret != again:
             self.banner.show_message("caution", "", "The two passwords don't match.")
             return
         # Windows checks the password first, which can take a while on a work PC
         # whose domain controller is out of reach: keep the window responsive.
-        self.accept_button.setEnabled(False)
-        self.banner.show_message("info", "", "Checking the password with Windows…")
+        self.accept_button.set_busy(True, "Checking…")
+        self.match.working("Checking the password with Windows…")
+        self.banner.hide()
         result = _Result(self)
         result.ready.connect(self._saved)
         user, domain = self.user, self.domain
@@ -263,9 +291,12 @@ class PasswordDialog(Dialog):
 
     def _saved(self, outcome: tuple[bool, str]) -> None:
         ok, problem = outcome
-        self.accept_button.setEnabled(True)
+        self.accept_button.set_busy(False)
         if not ok:
-            self.banner.show_message("critical", "", problem)
+            self.match.clear()
+            self.banner.show_message("critical", "Not saved", problem)
+            self.password.setFocus()
+            self._typed()
             return
         self.controller.client.request({"cmd": "reload_config"},
                                        lambda _r: self.controller.client.refresh_status())
@@ -300,7 +331,10 @@ class CameraDialog(Dialog):
             self.options[index] = camera.path
             self.body.addLayout(hbox(radio, label(hint, "Caption"), spacing=10, stretch_at=1))
         if not cameras:
-            self.body.addWidget(label("No cameras were found.", "Body2"))
+            self.body.addWidget(label("No cameras were found. Plug in your webcam, then open "
+                                      "this again.", "Body2", wrap=True))
+        self.problem = StatusLine()
+        self.body.addWidget(self.problem)
         self.add_buttons("Use this camera", destructive=False)
         self.accept_button.clicked.disconnect()
         self.accept_button.clicked.connect(self._save)
@@ -313,7 +347,7 @@ class CameraDialog(Dialog):
         if ok:
             self.accept()
         else:
-            self.body.addWidget(label(problem, "Body2", wrap=True))
+            self.problem.done("critical", f"That camera wasn't chosen: {problem}")
 
 
 def confirm_moved_camera(controller: AppController, parent: QWidget | None) -> None:
@@ -421,5 +455,119 @@ def confirm_quit(controller: AppController, parent: QWidget | None) -> None:
         controller.quit()
 
 
+class DiagnosticsDialog(Dialog):
+    """"Copy diagnostics": shows what's in the report, then copies it and saves a zip."""
+
+    def __init__(self, controller: AppController, parent: QWidget | None = None, *,
+                 folder=None):
+        super().__init__(parent, "Copy diagnostics for support", 620)
+        from .. import diagnostics
+        self.controller = controller
+        self._folder = folder or diagnostics.downloads_folder()
+        self.report = ""
+        self.body.addWidget(label(
+            "A plain-text report to share with whoever is helping you, for example in a "
+            "GitHub issue. Read it first if you like: nothing private goes in it.",
+            "Body2", wrap=True))
+        lists = QHBoxLayout()
+        lists.setSpacing(18)
+        for heading, items, glyph, tone in (
+                ("Included", diagnostics.INCLUDED, G.CHECK, "success"),
+                ("Never included", diagnostics.NEVER, G.EYE_OFF, "muted")):
+            column = QVBoxLayout()
+            column.setSpacing(4)
+            column.addWidget(label(heading, "CardTitle"))
+            for item in items:
+                row = hbox(GlyphLabel(glyph, 14, tone=tone), spacing=6)
+                row.addWidget(label(item, "Secondary", wrap=True), 1)
+                column.addLayout(row)
+            column.addStretch(1)
+            lists.addLayout(column, 1)
+        self.body.addLayout(lists)
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setAccessibleName("Diagnostics report")
+        self.preview.setPlaceholderText("Putting the report together…")
+        mono = self.preview.font()
+        mono.setFamily("Cascadia Mono")
+        mono.setStyleHint(mono.StyleHint.Monospace)
+        mono.setPixelSize(12)
+        self.preview.setFont(mono)
+        self.preview.setMinimumHeight(220)
+        self.body.addWidget(self.preview)
+        self.state = StatusLine()
+        self.state.working("Putting the report together…")
+        self.body.addWidget(self.state)
+        self.show_button = subtle_button("Show in folder", self._show_in_folder)
+        self.show_button.hide()
+        self.buttons.insertWidget(0, self.show_button)
+        self.add_buttons("Copy and save", cancel_text="Close")
+        self.accept_button.clicked.disconnect()
+        self.accept_button.clicked.connect(self._copy)
+        self.accept_button.set_busy(True, "Preparing…")
+        self.saved_path = None
+        result = _Result(self)
+        result.ready.connect(self._ready)
+        status = controller.client.status
+        system = dict(controller.system_state() or {})
+        cfg = controller.cfg
+
+        def run() -> None:
+            try:
+                from ..system_setup import autostart_state
+                system.setdefault("autostart", autostart_state())
+                device = ((status or {}).get("camera") or {}).get("device") or {}
+                who = diagnostics.Identities.from_environment(
+                    email=microsoft_account(),
+                    camera_paths=[cfg.camera_device_id, str(device.get("path") or "")])
+                outcome = diagnostics.collect(status=status, system=system, cfg=cfg, who=who)
+            except Exception as exc:  # noqa: BLE001 - say what went wrong, never crash
+                log.exception("diagnostics not collected")
+                outcome = exc
+            try:
+                result.ready.emit(outcome)
+            except RuntimeError:
+                pass  # the window was closed meanwhile
+
+        threading.Thread(target=run, name="diagnostics", daemon=True).start()
+
+    def _ready(self, outcome) -> None:
+        self.accept_button.set_busy(False)
+        if isinstance(outcome, Exception):
+            self.state.done("critical", f"The report couldn't be made ({outcome}).")
+            self.accept_button.setEnabled(False)
+            return
+        self.report = outcome
+        self.preview.setPlainText(outcome)
+        lines = outcome.count("\n")
+        self.state.done("info", f"Ready: {lines} lines. Copy and save puts it on the clipboard "
+                                f"and saves a zip in {self._folder.name}.")
+
+    def _copy(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        from .. import diagnostics
+        from .widgets import show_toast
+        if not self.report:
+            return
+        QApplication.clipboard().setText(self.report)
+        try:
+            self.saved_path = diagnostics.save_zip(self.report, self._folder)
+        except OSError as exc:
+            self.state.done("caution", f"Copied to the clipboard, but the zip couldn't be saved "
+                                       f"({exc.strerror or exc}).")
+            return
+        self.state.done("success", f"Copied to the clipboard and saved as "
+                                   rf"{self._folder.name}\{self.saved_path.name}.")
+        self.show_button.show()
+        self.accept_button.setText("Copy again")
+        show_toast(self, "Diagnostics copied")
+
+    def _show_in_folder(self) -> None:
+        import subprocess
+        if self.saved_path is not None:
+            subprocess.Popen(["explorer", "/select,", str(self.saved_path)])  # noqa: S603,S607
+
+
 __all__ = ["confirm", "PasswordDialog", "CameraDialog", "ProfileReviewDialog",
-           "confirm_moved_camera", "confirm_quit", "GlyphLabel", "G"]
+           "DiagnosticsDialog", "confirm_moved_camera", "confirm_quit", "GlyphLabel", "G"]
