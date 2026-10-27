@@ -45,7 +45,7 @@ struct SensitiveCredential {
 FaceCredential::FaceCredential(FaceCredentialProvider* owner)
     : m_cRef(1), m_cpus(CPUS_INVALID), m_pEvents(nullptr),
       m_label(L"Face Unlock"), m_status(L"Looking for you"), m_ready(false),
-      m_owner(owner) {
+      m_readyUntil(0), m_owner(owner) {
     DllAddRef();
 }
 
@@ -80,13 +80,27 @@ bool FaceCredential::CachePendingCredential(const std::wstring& username,
     SecureErase(m_cachedAttemptId);
     m_cachedAttemptId = attemptId;
     m_ready = true;
+    m_readyUntil = GetTickCount64() + kPendingLifetimeMs;
     m_status = L"Face recognised";
     return true;
 }
 
-bool FaceCredential::HasPendingCredential() const {
+bool FaceCredential::HasPendingCredential() {
     std::lock_guard<std::mutex> lock(m_mutex);
+    ExpireLocked();
     return m_ready;
+}
+
+bool FaceCredential::ExpirePendingCredential() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return ExpireLocked();
+}
+
+bool FaceCredential::ExpireLocked() {
+    if (!m_ready || GetTickCount64() < m_readyUntil) return false;
+    ClearLocked();
+    m_status = L"Looking for you";
+    return true;
 }
 
 bool FaceCredential::ConsumePendingCredential(std::wstring& username,
@@ -94,6 +108,7 @@ bool FaceCredential::ConsumePendingCredential(std::wstring& username,
                                               std::wstring& domain,
                                               std::string& attemptId) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    ExpireLocked();
     if (!m_ready) return false;
     username = m_cachedUsername;
     password = m_cachedPassword;
@@ -110,11 +125,29 @@ bool FaceCredential::ConsumePendingCredential(std::wstring& username,
 
 void FaceCredential::ClearPendingCredential() {
     std::lock_guard<std::mutex> lock(m_mutex);
+    ClearLocked();
+}
+
+void FaceCredential::ClearLocked() {
     SecureErase(m_cachedUsername);
     SecureErase(m_cachedPassword);
     SecureErase(m_cachedDomain);
     SecureErase(m_cachedAttemptId);
     m_ready = false;
+}
+
+void FaceCredential::ClearOwner() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_owner = nullptr;
+}
+
+void FaceCredential::Rearm() {
+    FaceCredentialProvider* owner = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        owner = m_owner;
+    }
+    if (owner) owner->RearmUnlockWorker();
 }
 
 IFACEMETHODIMP FaceCredential::QueryInterface(REFIID riid, void** ppv) {
@@ -174,7 +207,7 @@ IFACEMETHODIMP FaceCredential::SetSelected(BOOL* pbAutoLogon) {
         events->SetFieldString(this, FIELD_STATUS, status.c_str());
         events->Release();
     }
-    if (m_owner) m_owner->RearmUnlockWorker();
+    Rearm();
     return S_OK;
 }
 
@@ -242,7 +275,7 @@ IFACEMETHODIMP FaceCredential::GetSerialization(
                                   credential.password,
                                   credential.domain,
                                   attemptId)) {
-        if (m_owner) m_owner->RearmUnlockWorker();
+        Rearm();
         if (ppwszOptionalStatusText) {
             AllocStr(L"Waiting for a verified face - use another sign-in option if needed",
                      ppwszOptionalStatusText);
@@ -267,7 +300,7 @@ IFACEMETHODIMP FaceCredential::GetSerialization(
         hr = E_FAIL;
     }
     if (FAILED(hr)) {
-        ReportUnlockResult(attemptId, false);
+        ReportUnlockResult(attemptId, false, kNotSubmitted, 0);
         SecureErase(attemptId);
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -293,7 +326,6 @@ IFACEMETHODIMP FaceCredential::ReportResult(
     NTSTATUS ntsSubstatus,
     PWSTR* ppwszOptionalStatusText,
     CREDENTIAL_PROVIDER_STATUS_ICON* pcpsiOptionalStatusIcon) {
-    (void)ntsSubstatus;
     std::string attemptId;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -303,7 +335,9 @@ IFACEMETHODIMP FaceCredential::ReportResult(
     if (!attemptId.empty()) {
         // STATUS_SUCCESS is zero. Anything else explicitly discards the
         // staged sample. If Windows omits ReportResult, the service expires it.
-        ReportUnlockResult(attemptId, ntsStatus == 0, 750);
+        // The codes let the service tell a wrong password from other failures.
+        ReportUnlockResult(attemptId, ntsStatus == 0, static_cast<ULONG>(ntsStatus),
+                           static_cast<ULONG>(ntsSubstatus), 750);
         SecureErase(attemptId);
     }
     if (ppwszOptionalStatusText) *ppwszOptionalStatusText = nullptr;

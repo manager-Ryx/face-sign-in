@@ -1,6 +1,9 @@
 #include "PipeClient.h"
+#include <wtsapi32.h>
 #include <algorithm>
 #include <vector>
+
+#pragma comment(lib, "wtsapi32.lib")
 
 namespace FaceUnlock {
 
@@ -119,6 +122,56 @@ static bool WaitOrCancel(HANDLE cancelEvent, DWORD timeoutMs) {
     return WaitForSingleObject(cancelEvent, timeoutMs) == WAIT_TIMEOUT;
 }
 
+// The user a token belongs to, as a copy of its SID.
+static bool TokenUserSid(HANDLE token, std::vector<BYTE>& out) {
+    DWORD size = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+    if (size == 0) return false;
+    std::vector<BYTE> buffer(size);
+    if (!GetTokenInformation(token, TokenUser, buffer.data(), size, &size)) return false;
+    PSID sid = reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid;
+    if (!IsValidSid(sid)) return false;
+    const BYTE* bytes = static_cast<const BYTE*>(sid);
+    out.assign(bytes, bytes + GetLengthSid(sid));
+    return true;
+}
+
+// Who the service must be running as: the user signed in to this session.
+// The sign-in screen runs as SYSTEM and may ask Windows directly. Run as an
+// ordinary user (a test program), that isn't allowed, and the user is us.
+static bool ExpectedServerSid(std::vector<BYTE>& out) {
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session)) return false;
+    HANDLE token = nullptr;
+    if (!WTSQueryUserToken(session, &token)) {
+        if (GetLastError() != ERROR_PRIVILEGE_NOT_HELD) return false;  // e.g. nobody signed in
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    }
+    const bool ok = TokenUserSid(token, out);
+    CloseHandle(token);
+    return ok;
+}
+
+// Refuse a pipe created by anyone but the signed-in user: another account
+// could otherwise create \\.\pipe\FaceUnlock first and answer with a
+// password of its choosing (failed sign-ins that can lock the account).
+static bool VerifyPipeServer(HANDLE pipe) {
+    ULONG serverPid = 0;
+    if (!GetNamedPipeServerProcessId(pipe, &serverPid) || serverPid == 0) return false;
+    std::vector<BYTE> expected;
+    std::vector<BYTE> actual;
+    if (!ExpectedServerSid(expected)) return false;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, serverPid);
+    if (!process) return false;
+    HANDLE token = nullptr;
+    const BOOL opened = OpenProcessToken(process, TOKEN_QUERY, &token);
+    CloseHandle(process);
+    if (!opened) return false;
+    const bool read = TokenUserSid(token, actual);
+    CloseHandle(token);
+    return read && EqualSid(expected.data(), actual.data());
+}
+
 static bool OverlappedWait(HANDLE pipe,
                            OVERLAPPED& ov,
                            DWORD timeoutMs,
@@ -151,13 +204,19 @@ bool PipeCall(const std::wstring& pipeName,
         if (cancelEvent && WaitForSingleObject(cancelEvent, 0) != WAIT_TIMEOUT) {
             return false;
         }
+        // Identification level: the service may check who is calling (the
+        // sign-in screen, as SYSTEM) but can never act as SYSTEM.
         pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE,
-                           0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+                           0, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT |
+                               SECURITY_IDENTIFICATION,
+                           nullptr);
         if (pipe != INVALID_HANDLE_VALUE) break;
 
         const DWORD error = GetLastError();
         if (error == ERROR_PIPE_BUSY) {
             const DWORD waitMs = (std::min)(remaining(), static_cast<DWORD>(250));
+            if (waitMs == 0) break;  // 0 would mean "the server's default wait"
             WaitNamedPipeW(pipeName.c_str(), waitMs);
         } else if (error == ERROR_FILE_NOT_FOUND) {
             if (!WaitOrCancel(cancelEvent,
@@ -169,6 +228,10 @@ bool PipeCall(const std::wstring& pipeName,
         }
     }
     if (pipe == INVALID_HANDLE_VALUE) return false;
+    if (!VerifyPipeServer(pipe)) {
+        CloseHandle(pipe);
+        return false;
+    }
 
     DWORD mode = PIPE_READMODE_MESSAGE;
     if (!SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr)) {
@@ -225,10 +288,13 @@ bool RequestUnlock(std::wstring& username,
                    std::wstring& domain,
                    std::string& errorOut,
                    std::string& attemptId,
+                   bool selected,
                    HANDLE cancelEvent) {
     const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlock";
     SensitiveJson json;
-    if (!PipeCall(pipe, "{\"cmd\":\"unlock\"}", json.response,
+    const std::string request = selected ? "{\"cmd\":\"unlock\",\"selected\":true}"
+                                         : "{\"cmd\":\"unlock\",\"selected\":false}";
+    if (!PipeCall(pipe, request, json.response,
                   kUnlockRequestTimeoutMs,
                   cancelEvent)) {
         errorOut = (cancelEvent &&
@@ -267,13 +333,17 @@ bool RequestUnlock(std::wstring& username,
 
 bool ReportUnlockResult(const std::string& attemptId,
                         bool accepted,
+                        ULONG status,
+                        ULONG substatus,
                         DWORD timeoutMs) {
     if (attemptId.empty()) return true;
     // attemptId is generated by secrets.token_urlsafe, so it cannot contain
     // JSON metacharacters and may be embedded without a general serializer.
     const std::string request =
         "{\"cmd\":\"unlock_result\",\"attempt_id\":\"" + attemptId +
-        "\",\"accepted\":" + (accepted ? "true" : "false") + "}";
+        "\",\"accepted\":" + (accepted ? "true" : "false") +
+        ",\"status\":" + std::to_string(status) +
+        ",\"substatus\":" + std::to_string(substatus) + "}";
     std::string response;
     const bool called = PipeCall(L"\\\\.\\pipe\\FaceUnlock", request,
                                  response, timeoutMs, nullptr);

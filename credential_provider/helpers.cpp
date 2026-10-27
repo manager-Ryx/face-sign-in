@@ -1,6 +1,6 @@
 #include "helpers.h"
 #include <wincred.h>
-#include <intsafe.h>
+#include <climits>
 
 #pragma comment(lib, "credui.lib")
 #pragma comment(lib, "secur32.lib")
@@ -25,14 +25,15 @@ const FIELD_STATE_PAIR s_FieldStatePairs[FIELD_COUNT] = {
 // Copy `src` into buffer at cursor, set UNICODE_STRING fields so that
 // Buffer is an OFFSET (in bytes) from the start of the serialization
 // buffer — this is what LSA expects for CPGSR_RETURN_CREDENTIAL_FINISHED.
-static void PackString(UNICODE_STRING& u, PCWSTR src, BYTE* base, USHORT& cursor) {
-    USHORT len = (USHORT)(wcslen(src) * sizeof(WCHAR));
+static void PackString(UNICODE_STRING& u, const std::wstring& src, BYTE* base,
+                       size_t& cursor) {
+    const USHORT len = static_cast<USHORT>(src.size() * sizeof(WCHAR));  // checked by caller
     u.Length = len;
     u.MaximumLength = len;
     if (len > 0) {
-        memcpy(base + cursor, src, len);
+        memcpy(base + cursor, src.data(), len);
         u.Buffer = (PWSTR)(ULONG_PTR)cursor;   // store as OFFSET, not pointer
-        cursor = (USHORT)(cursor + len);
+        cursor += len;
     } else {
         u.Buffer = nullptr;
     }
@@ -45,9 +46,14 @@ HRESULT KerbPackInteractiveUnlock(const std::wstring& domain,
                                   CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* pcpcs) {
     const bool isUnlock = (cpus == CPUS_UNLOCK_WORKSTATION);
 
-    const USHORT dLen = (USHORT)(domain.size()   * sizeof(WCHAR));
-    const USHORT uLen = (USHORT)(username.size() * sizeof(WCHAR));
-    const USHORT pLen = (USHORT)(password.size() * sizeof(WCHAR));
+    // UNICODE_STRING lengths are 16-bit. A longer value would wrap (a
+    // 32768-character password would become an empty one), so refuse it.
+    const size_t dLen = domain.size()   * sizeof(WCHAR);
+    const size_t uLen = username.size() * sizeof(WCHAR);
+    const size_t pLen = password.size() * sizeof(WCHAR);
+    if (dLen > USHRT_MAX - 1 || uLen > USHRT_MAX - 1 || pLen > USHRT_MAX - 1) {
+        return E_INVALIDARG;
+    }
 
     // Always allocate at least KERB_INTERACTIVE_UNLOCK_LOGON (it's a superset
     // of KERB_INTERACTIVE_LOGON) so the LogonId field is zeroed for both scenarios.
@@ -63,10 +69,10 @@ HRESULT KerbPackInteractiveUnlock(const std::wstring& domain,
 
     logon->MessageType = isUnlock ? KerbWorkstationUnlockLogon : KerbInteractiveLogon;
 
-    USHORT cursor = (USHORT)headerSize;
-    PackString(logon->LogonDomainName, domain.c_str(),   buffer, cursor);
-    PackString(logon->UserName,        username.c_str(), buffer, cursor);
-    PackString(logon->Password,        password.c_str(), buffer, cursor);
+    size_t cursor = headerSize;
+    PackString(logon->LogonDomainName, domain,   buffer, cursor);
+    PackString(logon->UserName,        username, buffer, cursor);
+    PackString(logon->Password,        password, buffer, cursor);
 
     pcpcs->rgbSerialization = buffer;
     pcpcs->cbSerialization  = (ULONG)total;

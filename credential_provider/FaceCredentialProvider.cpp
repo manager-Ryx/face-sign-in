@@ -15,15 +15,21 @@ static void SecureErase(std::wstring& value) {
     }
 }
 
+// How long UnAdvise waits for the worker. A worker that is inside a LogonUI
+// callback can't finish while LogonUI's thread waits for it, so it is left to
+// finish on its own (it holds its own reference and is marked stale).
+static constexpr DWORD kRetireWaitMs = 3000;
+
 FaceCredentialProvider::FaceCredentialProvider()
     : m_cRef(1), m_cpus(CPUS_INVALID), m_pCred(nullptr), m_pEvents(nullptr),
       m_adviseContext(0),
       m_stopEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
-      m_workerActive(false), m_lastRearmTick(0) {
+      m_workerActive(false), m_lastRearmTick(0), m_generation(0) {
     DllAddRef();
 }
 
 FaceCredentialProvider::~FaceCredentialProvider() {
+    if (m_pCred) m_pCred->ClearOwner();  // LogonUI may still hold the credential
     UnAdvise();
     if (m_worker.joinable()) {
         // The worker holds a COM reference. If releasing that reference is
@@ -114,19 +120,24 @@ IFACEMETHODIMP FaceCredentialProvider::Advise(ICredentialProviderEvents* events,
     return S_OK;
 }
 
-IFACEMETHODIMP FaceCredentialProvider::UnAdvise() {
+void FaceCredentialProvider::RetireWorker() {
+    ++m_generation;
     if (m_stopEvent) SetEvent(m_stopEvent);
-    if (m_worker.joinable()) {
-        if (m_worker.get_id() != std::this_thread::get_id()) {
-            m_worker.join();
-        } else {
-            // Called from the worker itself (a synchronous CredentialsChanged
-            // callback). It cannot join itself; detach so a later Advise can
-            // start a fresh worker instead of failing with ERROR_BUSY. The
-            // worker keeps its own COM reference until it returns.
-            m_worker.detach();
-        }
+    if (!m_worker.joinable()) return;
+    if (m_worker.get_id() != std::this_thread::get_id() && m_workerDone &&
+        WaitForSingleObject(m_workerDone.get(), kRetireWaitMs) == WAIT_OBJECT_0) {
+        m_worker.join();
+    } else {
+        // Called from the worker itself (a synchronous CredentialsChanged
+        // callback), or it is still inside one. Detach so a later Advise can
+        // start a fresh worker. The worker keeps its own COM reference until
+        // it returns, and its generation is stale, so it changes nothing.
+        m_worker.detach();
     }
+}
+
+IFACEMETHODIMP FaceCredentialProvider::UnAdvise() {
+    RetireWorker();
     m_workerActive.store(false);
 
     {
@@ -171,18 +182,19 @@ bool FaceCredentialProvider::StartUnlockWorker(bool force) {
         return true;
     }
 
-    if (m_worker.joinable()) {
-        // PipeCall observes this event and abandons the current request.
-        SetEvent(m_stopEvent);
-        m_worker.join();
-    }
+    // PipeCall observes the stop event and abandons the current request.
+    RetireWorker();
     ResetEvent(m_stopEvent);
 
+    std::shared_ptr<void> done(CreateEventW(nullptr, TRUE, FALSE, nullptr), CloseHandle);
+    if (!done.get()) return false;
+    const unsigned generation = m_generation.load();
     AddRef();  // Keep the provider alive until the worker exits.
     m_workerActive.store(true);
     try {
-        m_worker = std::thread([this]() {
-            UnlockWorker();
+        m_worker = std::thread([this, generation, force, done]() {
+            UnlockWorker(generation, force);
+            SetEvent(done.get());
             Release();
         });
     } catch (...) {
@@ -190,6 +202,7 @@ bool FaceCredentialProvider::StartUnlockWorker(bool force) {
         Release();
         return false;
     }
+    m_workerDone = done;
     return true;
 }
 
@@ -207,14 +220,21 @@ void FaceCredentialProvider::RearmUnlockWorker() {
     }
 }
 
-void FaceCredentialProvider::UnlockWorker() {
+void FaceCredentialProvider::UnlockWorker(unsigned generation, bool selected) {
     struct WorkerGuard {
-        std::atomic<bool>& active;
-        ~WorkerGuard() { active.store(false); }
-    } guard{m_workerActive};
+        FaceCredentialProvider& provider;
+        unsigned generation;
+        ~WorkerGuard() {
+            if (provider.IsCurrent(generation)) provider.m_workerActive.store(false);
+        }
+    } guard{*this, generation};
 
     DWORD backoffMs = 100;
-    while (WaitForSingleObject(m_stopEvent, 0) == WAIT_TIMEOUT) {
+    while (IsCurrent(generation) && WaitForSingleObject(m_stopEvent, 0) == WAIT_TIMEOUT) {
+        // A match that was never used (Esc, another sign-in option) expires
+        // even if an earlier worker was stopped before it could withdraw it.
+        if (m_pCred && m_pCred->ExpirePendingCredential()) NotifyCredentialsChanged();
+
         std::wstring username;
         std::wstring password;
         std::wstring domain;
@@ -223,12 +243,14 @@ void FaceCredentialProvider::UnlockWorker() {
         bool matched = false;
         try {
             matched = RequestUnlock(username, password, domain, error,
-                                    attemptId, m_stopEvent);
+                                    attemptId, selected, m_stopEvent);
         } catch (...) {
             matched = false;
         }
+        selected = false;  // the tile's own retries are not you selecting it
 
-        const bool cancelled = WaitForSingleObject(m_stopEvent, 0) != WAIT_TIMEOUT;
+        const bool cancelled = !IsCurrent(generation) ||
+                               WaitForSingleObject(m_stopEvent, 0) != WAIT_TIMEOUT;
         if (!cancelled && matched && m_pCred &&
             m_pCred->CachePendingCredential(username, password, domain,
                                             attemptId)) {
@@ -239,11 +261,12 @@ void FaceCredentialProvider::UnlockWorker() {
             // One verified match produces at most one submission per Advise.
             // This prevents redraws or a rejected password from accumulating
             // automatic authentication attempts.
-            if (WaitForSingleObject(m_stopEvent, 15000) == WAIT_TIMEOUT &&
-                m_pCred->HasPendingCredential()) {
-                // If LogonUI never consumes the match, expire plaintext and
-                // withdraw auto-logon readiness after a short window.
-                m_pCred->ClearPendingCredential();
+            if (WaitForSingleObject(m_stopEvent,
+                                    static_cast<DWORD>(kPendingLifetimeMs) + 100) ==
+                    WAIT_TIMEOUT &&
+                m_pCred->ExpirePendingCredential()) {
+                // LogonUI never used the match: its plaintext is gone, and
+                // auto-logon readiness is withdrawn.
                 NotifyCredentialsChanged();
             }
             return;
