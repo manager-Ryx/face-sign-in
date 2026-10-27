@@ -44,7 +44,9 @@ STATE_DIR = APP_DIR / "state"
 BACKUP_DIR = APP_DIR / "backups"
 LEARNED_PHOTOS_DIR = APP_DIR / "learned-photos"
 
-PIPE_NAME = r"\\.\pipe\FaceUnlock"
+# The sign-in tile always uses \\.\pipe\FaceUnlock; the override lets tests run
+# without ever reaching the service that is running on the PC.
+PIPE_NAME = os.environ.get("FACE_UNLOCK_PIPE") or r"\\.\pipe\FaceUnlock"
 
 PRESENCE_MODES = ("recognition", "detection")
 UNLOCK_STRATEGIES = ("progressive", "fixed")

@@ -38,7 +38,10 @@ class _Call(QRunnable):
         except Exception:  # never let a worker crash silently
             log.exception("service request %s failed", self.request.get("cmd"))
             reply = None
-        self.relay.done.emit(self.callback, reply)
+        try:
+            self.relay.done.emit(self.callback, reply)
+        except RuntimeError:
+            pass  # the app is closing and the client is gone; nobody is waiting
 
 
 class ServiceClient(QObject):
