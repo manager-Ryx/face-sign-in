@@ -29,6 +29,15 @@ Your PIN and password always keep working. To remove it: *Settings → Apps →
 Windows Face Unlock → Uninstall*. Starting Windows in Safe Mode also turns
 off third-party sign-in tiles.
 
+**Installing with an AI agent?** Ask it something like *"Install Face Unlock
+from https://github.com/manager-Ryx/face-sign-in on this PC, following its
+AGENTS.md."* [AGENTS.md](AGENTS.md) tells Claude Code, Codex and other agents
+how to do everything they can by themselves. It also tells them to guide you
+through the few steps only you can do (the Windows permission prompt, your
+password, your face) and never to ask for your password.
+[`tools/check_install.ps1`](tools/check_install.ps1) checks an installation
+and says what's left to do.
+
 ## What it does
 
 - **Face sign-in on the lock screen** through a Windows Credential Provider
