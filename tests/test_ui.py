@@ -217,13 +217,22 @@ class ConfigWatchTests(unittest.TestCase):
         self.assertEqual(sent, ["reload_config"])
 
 
+def drew_something(path: Path) -> bool:
+    """A real screen has text, icons and controls: many distinct colours."""
+    from PySide6.QtGui import QImage
+    image = QImage(str(path)).convertToFormat(QImage.Format.Format_ARGB32)
+    pixels = np.frombuffer(image.constBits(), np.uint32, image.width() * image.height())
+    return len(np.unique(pixels)) > 4   # a blank window has one colour
+
+
 class RenderingTests(unittest.TestCase):
     def test_every_screen_renders_in_both_themes(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             for theme_name in ("light", "dark"):
                 written = render(Path(folder), theme_name, 1.0)
-                self.assertGreaterEqual(len(written), 7)
-                self.assertTrue(all(p.stat().st_size > 5000 for p in written))
+                self.assertGreaterEqual(len(written), 13)
+                blank = [p.name for p in written if not drew_something(p)]
+                self.assertEqual(blank, [])
 
     def test_switch_labels_follow_settings_loaded_later(self) -> None:
         from presence_monitor.ui.pages.settings import SettingsPage

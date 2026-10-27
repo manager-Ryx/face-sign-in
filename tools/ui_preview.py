@@ -199,6 +199,30 @@ def render(output: Path, theme_name: str, scale: float) -> list[Path]:
     path = output / f"{theme_name}-setup.png"
     wizard.grab().save(str(path))
     written.append(path)
+    written += _render_onboarding(app, controller, output, theme_name)
+    return written
+
+
+def _render_onboarding(app, controller, output: Path, theme_name: str) -> list[Path]:
+    """Every first-run step, with simulated PC checks (nothing on this PC is touched)."""
+    from presence_monitor.system_setup import TileState
+    from presence_monitor.ui.onboarding import STEPS, OnboardingWizard, SystemChecks
+    checks = SystemChecks(tile_state=lambda: TileState(False, problem="not installed"),
+                          install_tile=lambda: (True, ""), autostart_state=lambda: "tasks",
+                          enable_autostart=lambda: (True, ""), hello_only=lambda: False,
+                          start_service=lambda: None)
+    wizard = OnboardingWizard(controller, None, checks=checks)  # type: ignore[arg-type]
+    wizard.resize(820, 700)
+    wizard._local = {"tile": checks.tile_state(), "hello": False, "autostart": "tasks"}
+    written = []
+    for index in range(len(STEPS)):
+        wizard._go(index)
+        wizard.timer.stop()
+        for _ in range(3):
+            app.processEvents()
+        path = output / f"{theme_name}-welcome-{index + 1}.png"
+        wizard.grab().save(str(path))
+        written.append(path)
     return written
 
 

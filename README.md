@@ -70,9 +70,11 @@ thin client that talks to the Python service over `\\.\pipe\FaceUnlock`
 .\.venv\Scripts\python -m presence_monitor --show
 ```
 
-Then, in the app: **Set up** (guided face capture) and **Store password**. To
-enable the lock-screen tile, build and register the Credential Provider – see
-[INSTALL.md](INSTALL.md) and [credential_provider/README.md](credential_provider/README.md).
+First-run setup opens by itself and walks through the rest: it starts the
+service, picks your webcam, adds face sign-in to the lock screen (one
+Windows permission prompt), stores your password, captures your face and
+asks a few preferences. See [INSTALL.md](INSTALL.md) and
+[credential_provider/README.md](credential_provider/README.md).
 
 ## Development
 
@@ -95,6 +97,8 @@ camera, or the running service.
 - [docs/ENGINEERING.md](docs/ENGINEERING.md) – measurements, the code review
   and what was fixed, open items, and commercialisation blockers.
 - [INSTALL.md](INSTALL.md) – full install, configuration, troubleshooting.
+- [docs/ROADMAP.md](docs/ROADMAP.md) – what's needed before a public release,
+  and ranked ideas for features, tweaks, systems and UI.
 
 ## Commercial use
 

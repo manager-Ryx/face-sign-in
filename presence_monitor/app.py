@@ -8,9 +8,9 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
-import subprocess
 import sys
 import threading
+import time
 from dataclasses import asdict, replace
 from typing import Any
 
@@ -30,6 +30,8 @@ from PySide6.QtWidgets import QApplication
 from face_service.config import (
     APP_DIR,
     CONFIG_PATH,
+    CREDS_PATH,
+    EMBED_PATH,
     METRICS_DIR,
     PRESENCE_LOG_PATH,
     STATE_DIR,
@@ -42,6 +44,7 @@ from face_service.logs import setup_logging
 from face_service.metrics import MetricsStore
 from face_service.win_events import SessionWatcher
 
+from . import system_setup
 from .absence import AbsenceModel
 from .monitor import PresenceMonitor
 from .ui import theme
@@ -53,11 +56,17 @@ INSTANCE_KEY = f"FaceUnlockTray-{os.environ.get('USERNAME', 'user')}"
 APP_USER_MODEL_ID = "FaceUnlock.App"
 
 
+SYSTEM_CHECK_S = 30.0
+WATCHDOG_MISSES = 2          # status checks without an answer before restarting the service
+WATCHDOG_GAP_S = 300.0       # at most one restart this often
+
+
 class AppController(QObject):
     config_changed = Signal(object)
     status_changed = Signal(object)
     monitor_changed = Signal(object)
     session_event = Signal(str)
+    tile_result = Signal(bool, str)
 
     def __init__(self, app: QApplication):
         super().__init__()
@@ -79,7 +88,14 @@ class AppController(QObject):
             lambda: self.monitor_changed.emit(self.monitor.snapshot()))
         self._main_window = None
         self._wizard = None
+        self._onboarding = None
+        self._system: tuple[float, dict] | None = None
         self.tray = None
+        self.tile_result.connect(self._tile_done)
+        self._misses = 0
+        self._restarted_at = float("-inf")
+        self._quitting = False
+        self.client.status_changed.connect(self._watchdog)
         self.session_event.connect(self._on_session_event)
         hints = QGuiApplication.styleHints()
         hints.colorSchemeChanged.connect(self._on_system_scheme)
@@ -107,12 +123,14 @@ class AppController(QObject):
         self._monitor_timer.start(2000)
         self.client.set_polling(15000)
         self.client.refresh_status()
+        QTimer.singleShot(1500, self._first_run)
         if self.cfg.check_for_updates:
             QTimer.singleShot(60_000, self.check_for_updates_quietly)
 
     def quit(self) -> None:
         """Stop presence checks and the background service, then exit."""
         log.info("quit requested from the app")
+        self._quitting = True
         self.monitor.stop()
         self.watcher.stop()
 
@@ -121,6 +139,20 @@ class AppController(QObject):
             self.app.quit()
 
         self.client.request({"cmd": "shutdown"}, stopped, timeout_s=3.0)
+
+    def _watchdog(self, status: Any) -> None:
+        """If the background service stops answering, start it again (not after Quit)."""
+        if status is not None:
+            self._misses = 0
+            return
+        self._misses += 1
+        now = time.monotonic()
+        if (self._quitting or self._misses < WATCHDOG_MISSES
+                or not system_setup.onboarding_done() or now - self._restarted_at < WATCHDOG_GAP_S):
+            return
+        self._restarted_at = now
+        log.warning("the background service isn't answering; starting it again")
+        self.start_service()
 
     # ---- windows ---------------------------------------------------------------
 
@@ -134,6 +166,50 @@ class AppController(QObject):
         self.client.set_polling(3000 if visible else 15000)
         if visible:
             self.client.refresh_status()
+
+    def onboarding_done(self) -> bool:
+        return system_setup.onboarding_done()
+
+    def _first_run(self) -> None:
+        """Open first-run setup on a new PC (not where Face Unlock was already set up)."""
+        if system_setup.onboarding_done():
+            return
+        if EMBED_PATH.exists() and CREDS_PATH.exists():
+            system_setup.mark_onboarding_done()   # set up before first-run setup existed
+            return
+        self.open_onboarding()
+
+    def open_onboarding(self) -> None:
+        from .ui.onboarding import OnboardingWizard
+        if self._onboarding is not None and self._onboarding.isVisible():
+            self._onboarding.raise_()
+            self._onboarding.activateWindow()
+            return
+        self._onboarding = OnboardingWizard(self)
+        self._onboarding.finished.connect(lambda _code: self.client.refresh_status())
+        self._onboarding.show()
+        self._onboarding.raise_()
+        self._onboarding.activateWindow()
+
+    def system_state(self) -> dict:
+        """Quick local checks for the Overview (the registry; cached briefly)."""
+        now = time.monotonic()
+        if self._system is None or now - self._system[0] > SYSTEM_CHECK_S:
+            self._system = (now, {"tile": system_setup.tile_state(),
+                                  "hello": system_setup.hello_only_sign_in()})
+        return self._system[1]
+
+    def install_tile(self) -> None:
+        """Add the sign-in tile; Windows asks for permission, so off the UI thread."""
+        threading.Thread(target=lambda: self.tile_result.emit(*system_setup.install_tile()),
+                         name="install-tile", daemon=True).start()
+
+    def _tile_done(self, ok: bool, message: str) -> None:
+        self._system = None
+        if self.tray is not None:
+            self.tray.notify("Face sign-in added to the lock screen" if ok else
+                             "Face sign-in wasn't added", "" if ok else message)
+        self.client.refresh_status()
 
     def open_setup(self, mode: str = "append") -> None:
         from .ui.enroll import EnrollWizard
@@ -223,12 +299,11 @@ class AppController(QObject):
         self.client.request({"cmd": "presence"}, callback, timeout_s=25.0)
 
     def start_service(self) -> None:
-        """Start the background service through its scheduled task."""
+        """Start the background service (its scheduled task, or the program itself)."""
         try:
-            subprocess.Popen(["schtasks", "/Run", "/TN", "FaceUnlock-Service"],
-                             creationflags=subprocess.CREATE_NO_WINDOW)
+            system_setup.start_service()
         except OSError:
-            log.exception("could not start the service task")
+            log.exception("could not start the service")
         QTimer.singleShot(4000, self.client.refresh_status)
 
     def lock_now(self) -> None:
@@ -250,11 +325,11 @@ class AppController(QObject):
         threading.Thread(target=worker, name="update-check", daemon=True).start()
 
 
-def _activate_existing() -> bool:
+def _activate_existing(message: bytes = b"show") -> bool:
     socket = QLocalSocket()
     socket.connectToServer(INSTANCE_KEY)
     if socket.waitForConnected(500):
-        socket.write(b"show")
+        socket.write(message)
         socket.waitForBytesWritten(500)
         socket.disconnectFromServer()
         return True
@@ -284,7 +359,7 @@ def main() -> None:
     lock_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.TempLocation)
     instance_lock = QLockFile(os.path.join(lock_dir, INSTANCE_KEY + ".lock"))
     if not instance_lock.tryLock(100):
-        if _activate_existing():
+        if _activate_existing(b"welcome" if "--welcome" in sys.argv else b"show"):
             return
         instance_lock.removeStaleLockFile()
         if not instance_lock.tryLock(100):
@@ -299,11 +374,18 @@ def main() -> None:
     def on_connection() -> None:
         connection = server.nextPendingConnection()
         if connection is not None:
-            connection.readyRead.connect(lambda: controller.show_main())
+            def received() -> None:
+                if bytes(connection.readAll().data()).startswith(b"welcome")                         and not controller.onboarding_done():
+                    controller.open_onboarding()
+                else:
+                    controller.show_main()
+            connection.readyRead.connect(received)
 
     server.newConnection.connect(on_connection)
     controller.start()
-    if "--show" in sys.argv or controller.config_problems:
+    if "--welcome" in sys.argv:
+        controller.open_onboarding()
+    elif "--show" in sys.argv or controller.config_problems:
         controller.show_main()
     code = app.exec()
     instance_lock.unlock()

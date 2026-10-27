@@ -146,6 +146,23 @@ class ServiceTests(unittest.TestCase):
     def test_logging_caller_check_still_allows(self) -> None:
         self.assertTrue(self.unlock([ME], USER)["ok"])
 
+    def test_a_password_windows_keeps_rejecting_stops_being_replayed(self) -> None:
+        import os
+
+        from face_service.config import CREDS_PATH
+        CREDS_PATH.write_bytes(b"stored")
+        for _ in range(2):  # e.g. the Windows password was changed
+            attempt = self.unlock([ME])["attempt_id"]
+            self.service.handle({"cmd": "unlock_result", "attempt_id": attempt,
+                                 "accepted": False}, SYSTEM)
+        response = self.unlock([ME])
+        self.assertEqual(response["reason"], "password-rejected")
+        self.assertNotIn("password", response)
+        self.assertIn("password-rejected", self.service.status()["not_ready"])
+        later = CREDS_PATH.stat().st_mtime + 10
+        os.utime(CREDS_PATH, (later, later))  # you saved the new password
+        self.assertTrue(self.unlock([ME])["ok"])
+
     def test_missing_credentials(self) -> None:
         with patch("face_service.service.load_password", return_value=None):
             self.assertEqual(self.unlock([ME])["reason"], "no-credentials")

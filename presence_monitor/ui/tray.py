@@ -55,6 +55,8 @@ class TrayController:
         self.resume_action = self._action(G.PLAY, "Resume auto-lock", c.monitor.resume)
         self.menu.addSeparator()
         self._action(G.FACE, "Test face recognition", lambda: c.show_main("face"))
+        if not c.onboarding_done():
+            self._action(G.SETTINGS, "Set up Face Unlock…", c.open_onboarding)
         self._action(G.ADD, "Add my current appearance…", lambda: c.open_setup("append"))
         self._action(G.SETTINGS, "Settings", lambda: c.show_main("settings"))
         self.menu.addSeparator()
@@ -77,7 +79,7 @@ class TrayController:
 
     def _update(self, status) -> None:
         c = self.controller
-        overview = summarize(status, c.monitor.snapshot(), c.cfg)
+        overview = summarize(status, c.monitor.snapshot(), c.cfg, c.system_state())
         self.icon.setIcon(tray_icon(overview.tray_state))
         self.icon.setToolTip(f"Face Unlock — {overview.tray_text}")
         self.header.setText(overview.tray_text)

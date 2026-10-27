@@ -72,14 +72,58 @@ def confirm(parent: QWidget | None, title: str, message: str, accept_text: str, 
     return dialog.exec() == QDialog.DialogCode.Accepted
 
 
+def windows_account() -> tuple[str, str]:
+    return os.environ.get("USERNAME", ""), os.environ.get("USERDOMAIN", ".")
+
+
+def verify_windows_password(user: str, domain: str, secret: str) -> tuple[bool, str]:
+    """Check the password with Windows before it is stored.
+
+    A wrong stored password would be replayed at every face sign-in, and
+    Windows counts each one as a failed sign-in (work PCs may lock the
+    account), so only a password Windows has accepted is ever stored.
+    """
+    import pywintypes
+    import win32con
+    import win32security
+    try:
+        token = win32security.LogonUser(user, domain, secret, win32con.LOGON32_LOGON_INTERACTIVE,
+                                        win32con.LOGON32_PROVIDER_DEFAULT)
+        token.Close()
+        return True, ""
+    except pywintypes.error as exc:
+        if exc.winerror == 1326:  # ERROR_LOGON_FAILURE
+            return False, ("Windows didn't accept that password. If you sign in with a "
+                           "Microsoft account, use its password, not your PIN.")
+        if exc.winerror == 1327:  # ERROR_ACCOUNT_RESTRICTION, e.g. no blank passwords
+            return False, "Windows doesn't allow this account to sign in with a password."
+        return False, f"Windows couldn't check the password ({exc.strerror})."
+
+
+def store_windows_password(user: str, domain: str, secret: str) -> tuple[bool, str]:
+    """Verify, then store the password encrypted for this Windows account."""
+    if not secret:
+        return False, "Type your Windows password."
+    ok, problem = verify_windows_password(user, domain, secret)
+    if not ok:
+        return False, problem
+    from face_service.credentials import save_password
+    try:
+        save_password(user, secret, domain)
+    except Exception as exc:  # DPAPI or file errors
+        log.exception("password not stored")
+        return False, f"It couldn't be saved ({exc})."
+    log.info("Windows password stored for face sign-in")
+    return True, ""
+
+
 class PasswordDialog(Dialog):
     """Store the Windows password used by face sign-in (DPAPI-encrypted)."""
 
     def __init__(self, controller: AppController, parent: QWidget | None = None):
         super().__init__(parent, "Store your Windows password", 500)
         self.controller = controller
-        self.user = os.environ.get("USERNAME", "")
-        self.domain = os.environ.get("USERDOMAIN", ".")
+        self.user, self.domain = windows_account()
         self.body.addWidget(label(
             "Face sign-in hands this password to Windows when it recognises you. It's encrypted "
             "with Windows (DPAPI) so only your account on this PC can read it. If you change your "
@@ -112,47 +156,19 @@ class PasswordDialog(Dialog):
         self.password.setEchoMode(mode)
         self.repeat.setEchoMode(mode)
 
-    def _verify(self, secret: str) -> tuple[bool, str]:
-        """Check the password with Windows before storing it."""
-        import pywintypes
-        import win32con
-        import win32security
-        try:
-            token = win32security.LogonUser(self.user, self.domain, secret,
-                                            win32con.LOGON32_LOGON_INTERACTIVE,
-                                            win32con.LOGON32_PROVIDER_DEFAULT)
-            token.Close()
-            return True, ""
-        except pywintypes.error as exc:
-            if exc.winerror == 1326:  # ERROR_LOGON_FAILURE
-                return False, "Windows didn't accept that password."
-            return True, f"Windows couldn't check it ({exc.strerror}); it was saved anyway."
-
     def _save(self) -> None:
         secret, again = self.password.text(), self.repeat.text()
-        if not secret:
-            self.banner.show_message("caution", "", "Type your Windows password.")
-            return
         if secret != again:
             self.banner.show_message("caution", "", "The two passwords don't match.")
             return
-        ok, note = self._verify(secret)
+        ok, problem = store_windows_password(self.user, self.domain, secret)
+        self.password.clear()
+        self.repeat.clear()
         if not ok:
-            self.banner.show_message("critical", "", note)
+            self.banner.show_message("critical", "", problem)
             return
-        from face_service.credentials import save_password
-        try:
-            save_password(self.user, secret, self.domain)
-        except Exception as exc:  # DPAPI or file errors
-            log.exception("password not stored")
-            self.banner.show_message("critical", "Not saved", str(exc))
-            return
-        finally:
-            self.password.clear()
-            self.repeat.clear()
-        log.info("Windows password stored for face sign-in")
-        if note:
-            self.banner.show_message("caution", "", note)
+        self.controller.client.request({"cmd": "reload_config"},
+                                       lambda _r: self.controller.client.refresh_status())
         self.accept()
 
 

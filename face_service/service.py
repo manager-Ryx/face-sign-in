@@ -62,6 +62,7 @@ from .evaluation_store import EvaluationStore
 from .exposure import calibrate_focus
 from .logs import setup_logging
 from .metrics import MetricsStore
+from .models import provide_bundled_models, recognition_model_present
 from .pacing import LockScreenPacer
 from .pipe import ClientInfo, PipeServer
 from .profile import SOURCE_ENROLLMENT, SOURCE_MANUAL, SOURCE_PASSWORD, SOURCE_PRESENCE
@@ -96,6 +97,10 @@ PASSWORD_LOOKBACK_S = 120.0
 PASSWORD_SAMPLES = 3
 PASSWORD_ANCHOR_SLACK = 0.15   # may be this much further from your photos than a match
 PRESENCE_LEARN_GAP_S = 600.0   # at most one view learned while you sit, per ten minutes
+# Windows rejected the stored password this many times in a row: it is probably out
+# of date. Stop replaying it (each attempt counts as a failed sign-in, and work PCs
+# may lock the account) until a new one is saved.
+PASSWORD_REJECTIONS = 2
 CAUGHT_TEXT = {"instant": "by face straight away", "quick-look": "by face on a quick look",
                "other": "another way"}
 
@@ -165,6 +170,8 @@ class FaceService:
         self._auto_lock_notice: tuple[float, float] | None = None  # (when, seconds away)
         self._face_sign_in_at: float | None = None                 # wall clock
         self._presence_learned_at = float("-inf")
+        self._rejections = 0
+        self._rejected_password: float | None = None   # mtime of the stored password then
         self._caller_seen: tuple[str | None, bool] | None = None
         self._device_status: tuple[float, dict] | None = None
         self._ready_reason = "starting"
@@ -270,6 +277,31 @@ class FaceService:
                 if reason == "match" and session.accepted_at is None:
                     session.accepted_at = self._clock()
                     session.accepted_mode = mode
+
+    def _password_out_of_date(self) -> bool:
+        """Windows kept rejecting the stored password, and no new one has been saved."""
+        if self._rejected_password is None:
+            return False
+        try:
+            if CREDS_PATH.stat().st_mtime != self._rejected_password:
+                self._rejected_password, self._rejections = None, 0   # a new password
+                return False
+        except OSError:
+            return False
+        return True
+
+    def _note_password_result(self, accepted: bool) -> None:
+        if accepted:
+            self._rejections = 0
+            return
+        self._rejections += 1
+        if self._rejections >= PASSWORD_REJECTIONS and self._rejected_password is None:
+            try:
+                self._rejected_password = CREDS_PATH.stat().st_mtime
+            except OSError:
+                return
+            log.warning("Windows rejected the stored password %d times; face sign-in paused "
+                        "until it is updated", self._rejections)
 
     def _keep_for_learning(self, verdict: Verdict) -> None:
         """Remember this lock's views of a face, in case you then sign in another way."""
@@ -523,6 +555,9 @@ class FaceService:
             if not armed:
                 reason = "just-locked"
                 return {"ok": False, "reason": "just-locked"}
+            if self._password_out_of_date():
+                reason = "password-rejected"
+                return {"ok": False, "reason": "password-rejected"}
             credential = load_password()
             if not credential:
                 reason = "no-credentials"
@@ -586,6 +621,7 @@ class FaceService:
         if attempt is None:
             log.info("unlock result for an unknown, expired, or repeated attempt ignored")
             return {"ok": True, "added": 0}
+        self._note_password_result(accepted)
         if accepted:
             self._face_sign_in_at = self._wall_clock()
             with self._session_lock:
@@ -757,6 +793,8 @@ class FaceService:
             reasons.append("not-enrolled")
         if not CREDS_PATH.exists():
             reasons.append("no-credentials")
+        elif self._password_out_of_date():
+            reasons.append("password-rejected")
         if device.get("state") != "ready":
             reasons.append(f"camera-{device.get('state')}")
         ready = not reasons
@@ -776,6 +814,7 @@ class FaceService:
                             "anti_spoofing": self.cfg.anti_spoofing,
                             "model": self.cfg.model_name, "strategy": self.cfg.unlock_strategy,
                             "model_loaded": self.recognizer.embedder.loaded,
+                            "model_present": recognition_model_present(),
                             "compiled": self.recognizer.embedder.compiled_ok},
             "learning": {"enabled": self.cfg.adaptive_enrollment, "last": last_learned},
             "credentials": CREDS_PATH.exists(),
@@ -1036,6 +1075,7 @@ class FaceService:
         """Load the profile and model so the first sign-in is fast."""
         self._ready_reason = "loading"
         try:
+            provide_bundled_models()  # a new PC: use the shipped model, no download
             try:
                 loaded = self.recognizer.load()
                 log.info("face profile loaded: %s", loaded)

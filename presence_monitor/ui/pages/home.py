@@ -129,7 +129,7 @@ class HomePage(Page):
 
     def refresh(self) -> None:
         c = self.controller
-        overview = summarize(c.client.status, c.monitor.snapshot(), c.cfg)
+        overview = summarize(c.client.status, c.monitor.snapshot(), c.cfg, c.system_state())
         glyph = {"success": G.DONE, "caution": G.WARNING, "critical": G.ERROR}.get(
             overview.tone, G.INFO)
         self.hero_icon.set_glyph(glyph, overview.tone)
@@ -152,7 +152,15 @@ class HomePage(Page):
         if self._action == "start-service":
             c.start_service()
         elif self._action == "setup":
-            c.open_setup("replace")
+            if c.onboarding_done():
+                c.open_setup("replace")
+            else:
+                c.open_onboarding()
+        elif self._action == "install-tile":
+            c.install_tile()
+        elif self._action == "hello-settings":
+            import os
+            os.startfile("ms-settings:signinoptions")  # type: ignore[attr-defined]
         elif self._action == "password":
             from ..dialogs import PasswordDialog
             PasswordDialog(c, self).exec()

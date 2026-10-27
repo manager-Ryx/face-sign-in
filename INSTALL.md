@@ -29,15 +29,28 @@ anti-spoofing, the two MiniFASNet files. See `installer\download_weights.py`.
 .\.venv\Scripts\pythonw -m presence_monitor --show
 ```
 
-In the app:
+On a PC that hasn't been set up, **first-run setup** opens by itself (the
+installer opens it at the end; `--welcome` opens it on demand):
 
-1. **Set up** – a guided capture: good light in front of you, look at the
-   camera, then turn your head slightly as asked. About a minute. Nothing
-   replaces your profile until you select **Save face profile**.
-2. **Store password** – your Windows *account* password (not your PIN). It is
-   checked with Windows, then encrypted with DPAPI for your account only.
-3. **Settings → Camera** – choose your webcam. Only that physical device is
-   ever used; virtual cameras (NVIDIA Broadcast, OBS) can't be chosen.
+1. **Welcome** – what is stored on the PC, and your agreement.
+2. **Get ready** – done for you where possible: starts the background
+   service, picks your webcam when there is only one real camera (virtual
+   cameras such as NVIDIA Broadcast or OBS are never chosen), waits for the
+   face model (shipped with the installer; otherwise downloaded once, about
+   130 MB), adds face sign-in to the lock screen (Windows asks for permission
+   once), and makes Face Unlock start when you sign in. It also warns when
+   Windows is set to "only allow Windows Hello sign-in", which hides the tile.
+3. **Password** – your Windows *account* password (not your PIN). It is
+   checked with Windows, then encrypted with DPAPI for your account only. If
+   Windows later rejects it twice (you changed it), face sign-in stops using
+   it and asks for the new one.
+4. **Your face** – a guided capture of about a minute, with *Take photo now*
+   and *Skip this angle* when an angle won't register.
+5. **Preferences** – auto-lock and its timeout, how eagerly the sign-in
+   screen looks for you, learning, notifications.
+6. **Try it** – a recognition test, and *Lock my PC now* to try signing in.
+
+Anything left undone shows on the Overview with a button to fix it.
 
 ## 3. Day-to-day behaviour
 

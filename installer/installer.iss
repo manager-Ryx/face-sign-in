@@ -46,8 +46,8 @@ UsePreviousTasks=yes
 Name: "english";  MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "cp"; Description: "Register the Credential Provider (enables log-in with your face)"; \
-  Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); GroupDescription: "Optional components"; Flags: unchecked
+Name: "cp"; Description: "Add face sign-in to the Windows lock screen (recommended)"; \
+  Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); GroupDescription: "Windows integration"
 Name: "startuptray"; Description: "Start the Face Unlock tray at sign-in"; GroupDescription: "Windows integration"
 
 [Files]
@@ -86,8 +86,10 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Fil
 Filename: "schtasks.exe"; Parameters: "/Run /TN ""\FaceUnlock-Service"""; Flags: runhidden skipifsilent runasoriginaluser
 Filename: "schtasks.exe"; Parameters: "/Run /TN ""\FaceUnlock-Presence"""; Flags: runhidden skipifsilent runasoriginaluser
 
-; 4. Post-install: if we started under SILENT (autoupdate), re-launch the tray.
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; \
+; 4. Open first-run setup (password, face, preferences). If the tray is already
+;    running it opens setup itself; on an upgrade that was set up before, the
+;    window just opens.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--welcome"; Description: "Set up {#MyAppName} now"; \
   Flags: nowait postinstall skipifsilent
 
 [UninstallRun]

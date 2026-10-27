@@ -142,7 +142,9 @@ def _autolock_tile(snapshot: dict, cfg: Config) -> Tile:
     return Tile(f"Locks after about {timeout}", detail, "On", "success")
 
 
-def summarize(status: dict | None, snapshot: dict, cfg: Config) -> Overview:
+def summarize(status: dict | None, snapshot: dict, cfg: Config,
+              system: dict | None = None) -> Overview:
+    """``system``: local checks ({"tile": TileState, "hello": bool}) when known."""
     if status is None:
         return Overview(
             "critical", "Face Unlock isn't running",
@@ -219,6 +221,25 @@ def summarize(status: dict | None, snapshot: dict, cfg: Config) -> Overview:
                    "encrypted so only your Windows account can read it.",
                    "password", "Store password", "attention", "Needs your password",
                    "no-credentials")
+    if "password-rejected" in (status.get("not_ready") or []):
+        return out("caution", "Windows didn't accept your saved password",
+                   "It has probably changed. Store your current Windows password so face "
+                   "sign-in can work again – until then it won't try, so Windows doesn't count "
+                   "failed sign-ins.", "password", "Update password", "attention",
+                   "Needs your new password", "password-rejected")
+    system = system or {}
+    if system.get("hello"):
+        return out("caution", "Windows only allows Windows Hello sign-in",
+                   "With this on, Windows hides Face Unlock on the lock screen. Turn off "
+                   "\u201cFor improved security, only allow Windows Hello sign-in\u201d in "
+                   "Sign-in options.", "hello-settings", "Open Sign-in options", "attention",
+                   "Hidden by Windows", "hello-only")
+    tile = system.get("tile")
+    if tile is not None and not tile.installed:
+        return out("caution", "Face sign-in isn't on your lock screen yet",
+                   "Add the Face Unlock sign-in tile. Windows will ask for your permission "
+                   "once. Auto-lock works without it.", "install-tile", "Add to lock screen",
+                   "attention", "Not on the lock screen", "tile-missing")
     problems = status.get("config_problems") or []
     if problems:
         return out("caution", "Some settings were reset to safe values", problems[0],

@@ -131,7 +131,7 @@ class MainWindow(QMainWindow):
 
     def _update_state(self) -> None:
         c = self.controller
-        overview = summarize(c.client.status, c.monitor.snapshot(), c.cfg)
+        overview = summarize(c.client.status, c.monitor.snapshot(), c.cfg, c.system_state())
         self.state_pill.set_state(overview.tray_text, {"ready": "success", "paused": "caution",
                                                        "attention": "caution",
                                                        "off": "critical"}[overview.tray_state])

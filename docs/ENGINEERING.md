@@ -46,6 +46,10 @@ From a full read plus an independent review. "Fixed" items have tests.
 | Settings edited outside the app could be overwritten by the tray's stale copy | **Fixed** (the tray watches `config.toml` and reloads; tested) |
 | A face recognised while walking past (screens off) left the PC unlocked and unattended until the hour-long auto-lock | **Fixed** (a face sign-in must be confirmed by a presence check after 30 s; otherwise the PC locks again after 2 min; tested) |
 | Windows+L while still facing the camera was undone about 3.6 s later | **Fixed** (after a lock of your own, face sign-in waits until you have stepped away, woken the screen or selected the tile; tested) |
+| A packaged install ignored the bundled ArcFace weights and would download 130 MB on first start (failing offline) | **Fixed** (the service puts shipped model files where DeepFace looks before first use; tested) |
+| After a Windows password change, the stale stored password would be replayed at every face sign-in – each a failed sign-in, which can lock a work account | **Fixed** (after two rejections it is no longer used until a new one is saved; the Overview asks for it; tested) |
+| The installer left face sign-in on the lock screen unticked, and nothing guided a new user through camera, password and face | **Fixed** (ticked by default; first-run setup opens after install and on any PC not set up) |
+| A stopped background service stayed stopped until the next sign-in | **Fixed** (the tray restarts it after two missed status checks, at most every 5 minutes, never after Quit; tested) |
 | Setup's Cancel did nothing (its close handling and Qt's re-entered each other, so Qt refused the close) | **Fixed** (one cancel path; tested) |
 | The taskbar showed Python's icon | **Fixed** (the app sets its own Windows app ID) |
 | Presence checks were skipped for 35 s after a sign-in, and the absence timer only started at the next 5-minute check | **Fixed** (the sign-in screen releases the camera as soon as you are signed in) |
