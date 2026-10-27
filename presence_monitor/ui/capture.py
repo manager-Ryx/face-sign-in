@@ -13,12 +13,22 @@ be skipped.
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from face_service.quality import FaceBox, ImageQuality, assess, primary_issue
+from face_service.quality import (
+    DARK,
+    DIM,
+    TOO_BRIGHT,
+    TOO_DARK,
+    FaceBox,
+    ImageQuality,
+    assess,
+    primary_issue,
+)
 
 POSES = ("center", "left", "right", "up", "down")
 POSE_GUIDANCE = {
@@ -48,6 +58,40 @@ STABLE_FRAMES = 3
 MIN_GAP_S = 0.6
 STUCK_S = 8.0        # after this long on one angle, a smaller movement is enough
 RELAXED = 0.5
+
+
+@dataclass(frozen=True)
+class Lighting:
+    """What the lighting meter shows: where the needle sits (0-1), its colour, a hint."""
+    level: float
+    tone: str          # "good", "caution", "critical" or "idle"
+    hint: str
+
+
+# Where the meter's zones change colour (face brightness 0-255, from face_service.quality).
+METER_ZONES = ((TOO_DARK, "critical"), (DIM, "caution"), (TOO_BRIGHT, "good"), (255.0, "caution"))
+
+
+def lighting(quality: ImageQuality | None) -> Lighting:
+    """Friendly words about the light on your face, from the capture's own measurements."""
+    if quality is None:
+        return Lighting(0.0, "idle", "Starting the camera…")
+    if "no_face" in quality.issues or not math.isfinite(quality.face_brightness):
+        return Lighting(min(1.0, quality.frame_brightness / 255.0), "idle",
+                        "Looking for your face…")
+    level = min(1.0, max(0.0, quality.face_brightness / 255.0))
+    if "too_dark" in quality.issues or quality.face_brightness < DARK:
+        return Lighting(level, "critical", "Too dark to see you well: turn on a lamp or face "
+                        "a window.")
+    if "backlit" in quality.issues:
+        return Lighting(level, "caution", "Very bright behind you: face the light, or close "
+                        "the blind behind you.")
+    if "too_bright" in quality.issues:
+        return Lighting(level, "caution", "Very bright on your face: move out of direct "
+                        "sunlight.")
+    if quality.face_brightness < DIM:
+        return Lighting(level, "caution", "A bit dark: turn on a lamp or face a window.")
+    return Lighting(level, "good", "Good light on your face.")
 
 
 def targets_for(mode: str) -> dict[str, int]:

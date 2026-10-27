@@ -16,14 +16,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cv2
-from PySide6.QtCore import QRectF, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QProgressBar,
     QRadioButton,
-    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -35,15 +34,20 @@ from face_service.detector import FaceDetector
 from face_service.exposure import expose_for_face
 from face_service.quality import to_gray
 
-from . import theme
-from .capture import CapturePlan, Observation, targets_for
+from . import sounds
+from .camera_view import LightMeter, Preview, TurnHint, mirrored_image
+from .capture import CapturePlan, Observation, lighting, targets_for
 from .icons import G, GlyphLabel
 from .widgets import (
     Banner,
     Card,
     ProgressRing,
+    StepIndicator,
+    SuccessBadge,
     accent_button,
     button,
+    fade_in,
+    glyph_button,
     hbox,
     label,
     subtle_button,
@@ -124,104 +128,11 @@ class CaptureWorker(QThread):
                 now = time.monotonic()
                 if now - last_emit >= 1.0 / PREVIEW_FPS:
                     last_emit = now
-                    mirrored = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
-                    height, width = mirrored.shape[:2]
-                    image = QImage(mirrored.data, width, height, 3 * width,
-                                   QImage.Format.Format_RGB888).copy()
-                    self.preview.emit(image, observation)
+                    self.preview.emit(mirrored_image(frame), observation)
         except CameraError as exc:
             self.failed.emit(str(exc))
         finally:
             camera.close()
-
-
-class Preview(QWidget):
-    """Live, mirrored camera view with an oval guide and a guidance pill."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.image: QImage | None = None
-        self.observation: Observation | None = None
-        self.message = "Starting the camera…"
-        self.setMinimumSize(560, 420)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setAccessibleName("Camera preview")
-
-    def sizeHint(self) -> QSize:  # noqa: N802 - Qt API
-        return QSize(640, 480)
-
-    def show_frame(self, image: QImage, observation: Observation) -> None:
-        self.image = image
-        self.observation = observation
-        self.message = observation.guidance
-        self.update()
-
-    def show_message(self, message: str) -> None:
-        self.image = None
-        self.observation = None
-        self.message = message
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
-        t = theme.current()
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        area = QRectF(self.rect())
-        clip = QPainterPath()
-        clip.addRoundedRect(area, 12, 12)
-        painter.setClipPath(clip)
-        painter.fillRect(area, QColor(t.preview_bg))
-        if self.image is not None:
-            scale = max(area.width() / self.image.width(), area.height() / self.image.height())
-            w, h = self.image.width() * scale, self.image.height() * scale
-            target = QRectF((area.width() - w) / 2, (area.height() - h) / 2, w, h)
-            painter.drawImage(target, self.image)
-        oval = QRectF(area.center().x() - area.width() * 0.2, area.height() * 0.14,
-                      area.width() * 0.4, area.height() * 0.68)
-        tone = self.observation.tone if self.observation else "idle"
-        color = {"good": QColor(t.accent), "issue": QColor("#F7B500")}.get(tone, QColor("white"))
-        painter.setPen(QPen(color, 3))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(oval)
-        if self.message:
-            painter.setFont(theme.font(15, strong=True))
-            metrics = painter.fontMetrics()
-            width = min(area.width() - 32, metrics.horizontalAdvance(self.message) + 36)
-            pill = QRectF((area.width() - width) / 2, area.height() - 58, width, 38)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(0, 0, 0, 170))
-            painter.drawRoundedRect(pill, 19, 19)
-            painter.setPen(QColor("white"))
-            painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, self.message)
-        painter.end()
-
-
-class StepHeader(QWidget):
-    STEPS = ("Get ready", "Capture", "Review and save", "Done")
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setObjectName("Transparent")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
-        self.labels = []
-        for number, text in enumerate(self.STEPS, 1):
-            item = label(f"{number}  {text}", "Secondary")
-            self.labels.append(item)
-            layout.addWidget(item)
-        layout.addStretch(1)
-
-    def set_step(self, index: int) -> None:
-        t = theme.current()
-        for position, item in enumerate(self.labels):
-            if position == index:
-                item.setStyleSheet(f"color: {t.accent_text}; font-weight: 600;")
-            elif position < index:
-                item.setStyleSheet(f"color: {t.text};")
-            else:
-                item.setStyleSheet(f"color: {t.text3};")
 
 
 class EnrollWizard(QDialog):
@@ -250,7 +161,7 @@ class EnrollWizard(QDialog):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 24, 28, 22)
         outer.setSpacing(14)
-        self.steps = StepHeader()
+        self.steps = StepIndicator(("Get ready", "Capture", "Review and save", "Done"))
         outer.addWidget(self.steps)
         self.stack = QStackedWidget()
         outer.addWidget(self.stack, 1)
@@ -309,20 +220,37 @@ class EnrollWizard(QDialog):
         layout.setSpacing(10)
         self.preview = Preview()
         layout.addWidget(self.preview, 1)
+        self.turn_hint = TurnHint(64)
         self.guidance = label("", "CardTitle", wrap=True)
         self.guidance.setAccessibleName("Guidance")
+        self.guidance.setMinimumHeight(40)   # room for two lines, so nothing below jumps
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
         self.progress.setAccessibleName("Photos taken")
         self.progress_text = label("", "Secondary")
-        layout.addLayout(hbox(self.guidance, self.progress_text, spacing=12, stretch_at=1))
-        layout.addWidget(self.progress)
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        row.addWidget(self.turn_hint, 0, Qt.AlignmentFlag.AlignVCenter)
+        words = QVBoxLayout()
+        words.setSpacing(6)
+        words.addLayout(hbox(self.guidance, self.progress_text, spacing=12, stretch_at=1))
+        words.addWidget(self.progress)
+        row.addLayout(words, 1)
+        self.meter = LightMeter()
+        self.meter.setFixedWidth(230)
+        row.addWidget(self.meter, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(row)
         # Fail-safes for when the automatic capture won't trigger.
         self.take_button = button("Take photo now", self._take_now)
         self.take_button.setToolTip("Use this view for the angle being asked for, even in poor "
                                     "light.")
         self.skip_button = subtle_button("Skip this angle", self._skip_angle)
-        layout.addLayout(hbox(self.take_button, self.skip_button, stretch_at=2))
+        self.skip_button.setToolTip("Leave out this angle. Straight-on photos can't be skipped.")
+        self.sound_button = glyph_button(G.VOLUME, "", self._toggle_sound, size=32)
+        self.sound_button.setCheckable(True)
+        self._show_sound_state()
+        layout.addLayout(hbox(self.take_button, self.skip_button, None, self.sound_button,
+                              stretch_at=2))
         return page
 
     def _review_page(self) -> QWidget:
@@ -344,7 +272,7 @@ class EnrollWizard(QDialog):
         page.setObjectName("Transparent")
         layout = QVBoxLayout(page)
         layout.setSpacing(12)
-        self.done_icon = GlyphLabel(G.DONE, 40, tone="success")
+        self.done_icon = SuccessBadge(56)
         layout.addWidget(self.done_icon)
         self.done_title = label("", "PageTitle", wrap=True)
         self.done_text = label("", "Body2", wrap=True)
@@ -354,7 +282,10 @@ class EnrollWizard(QDialog):
         return page
 
     def _go(self, index: int) -> None:
+        changed = index != self.stack.currentIndex()
         self.stack.setCurrentIndex(index)
+        if changed:
+            fade_in(self.stack.currentWidget())
         self.steps.set_step(index)
         self.banner.hide()
         texts = {0: ("Start camera", ""), 1: ("", "Pause"), 2: ("Save face profile", "Retake"),
@@ -416,11 +347,13 @@ class EnrollWizard(QDialog):
             self._go(1)
             self.secondary.setText("Pause")
             self.preview.show_message("Starting the camera…")
+            self.meter.show_lighting(lighting(None))
             self._update_progress(self.plan.taken, self.plan.total)
             self._retire(self.worker)
             self.worker = CaptureWorker(self.controller, self.staging, self.plan)
             self.worker.preview.connect(self._on_preview)
             self.worker.captured.connect(self._update_progress)
+            self.worker.captured.connect(self._photo_taken)
             self.worker.failed.connect(self._on_failed)
             self.worker.notice.connect(self.guidance.setText)
             self.worker.finished.connect(self._on_worker_finished)
@@ -450,6 +383,8 @@ class EnrollWizard(QDialog):
 
     def _on_preview(self, image: QImage, observation: Observation) -> None:
         self.preview.show_frame(image, observation)
+        self.turn_hint.set_pose(observation.wanted)
+        self.meter.show_lighting(lighting(observation.quality))
         text = observation.guidance
         if observation.box is not None and (observation.stuck or observation.tone == "issue"):
             text += (" Or press “Take photo now” to use this view anyway"
@@ -471,6 +406,26 @@ class EnrollWizard(QDialog):
         self.progress.setMaximum(total)
         self.progress.setValue(taken)
         self.progress_text.setText(f"{taken} of {total} photos")
+        self.progress.setAccessibleDescription(f"{taken} of {total} photos taken")
+
+    def _photo_taken(self, taken: int, total: int) -> None:
+        """A flash and a soft click for each photo; a chime for the last one."""
+        self.preview.snap()
+        if self.controller.cfg.capture_sounds:
+            sounds.play(sounds.DONE if taken >= total else sounds.SHUTTER)
+
+    def _toggle_sound(self) -> None:
+        self.controller.update_config(capture_sounds=not self.controller.cfg.capture_sounds)
+        self._show_sound_state()
+
+    def _show_sound_state(self) -> None:
+        on = self.controller.cfg.capture_sounds
+        self.sound_button.setText(G.VOLUME if on else G.MUTE)
+        self.sound_button.setChecked(not on)
+        tip = ("Sound on: a soft click for each photo. Select to mute." if on
+               else "Sound off. Select to hear a soft click for each photo.")
+        self.sound_button.setToolTip(tip)
+        self.sound_button.setAccessibleName(tip)
 
     def _on_failed(self, message: str) -> None:
         self.preview.show_message("The camera couldn't be used.")
@@ -560,7 +515,8 @@ class EnrollWizard(QDialog):
                 return
             self.staging = None  # the service moved the photos into the profile folder
             self._go(3)
-            self.done_title.setText("Face profile saved")
+            self.done_icon.play()
+            self.done_title.setText("All done: face profile saved")
             self.done_text.setText(
                 f"Face Unlock now has {reply['anchors']} reference photos"
                 + (f" and {reply['learned']} learned samples" if reply.get("learned") else "")

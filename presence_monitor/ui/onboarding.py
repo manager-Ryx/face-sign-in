@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import system_setup
+from .camera_view import CameraPeek
 from .dialogs import (
     PASSWORD_REASON,
     microsoft_account,
@@ -49,9 +51,14 @@ from .widgets import (
     Card,
     ProgressRing,
     SettingRow,
+    StatusLine,
+    StepIndicator,
+    SuccessBadge,
     ToggleSwitch,
+    VScroll,
     accent_button,
     button,
+    fade_in,
     hbox,
     label,
     subtle_button,
@@ -126,6 +133,10 @@ class CheckRow(SettingRow):
 
     def __init__(self, glyph: str, title: str):
         super().__init__(glyph, title, "")
+        self.layout().setContentsMargins(16, 8, 16, 8)   # compact: five rows and the camera
+        for unused in (self.saved_mark, self.reset_button):   # not settings: no slots needed
+            self.layout().removeWidget(unused)
+            unused.deleteLater()
         self.mark = GlyphLabel(G.DONE, 18, tone="success")
         self.ring = ProgressRing(18)
         self.action = button("", None)
@@ -157,10 +168,13 @@ class CheckRow(SettingRow):
 
     def show_state(self, state: str, text: str, action: str = "", slot=None) -> None:
         """``state``: ok, working, action or problem."""
+        became_ok = state == "ok" and not self.ok
         self.ok = state == "ok"
         self.bar.hide()
         self.set_description(text)
         self.mark.setVisible(self.ok)
+        if became_ok:
+            fade_in(self.mark, 260)   # each item ticks itself off as it's ready
         self.ring.setVisible(state == "working")
         self.action.setVisible(bool(action))
         if action:
@@ -187,37 +201,39 @@ class OnboardingWizard(QDialog):
         self._local: dict | None = None    # tile, Windows Hello-only, autostart
         self._ticks = 0
         self.setWindowTitle("Set up Face Unlock")
-        self.setMinimumSize(760, 680)
+        self.setMinimumSize(780, 720)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 24, 28, 22)
         outer.setSpacing(14)
-        self.header = QHBoxLayout()
-        self.header.setSpacing(18)
-        self.step_labels = []
-        for number, text in enumerate(STEPS, 1):
-            item = label(f"{number}  {text}", "Secondary")
-            self.step_labels.append(item)
-            self.header.addWidget(item)
-        self.header.addStretch(1)
-        outer.addLayout(self.header)
+        self.steps = StepIndicator(STEPS)
+        outer.addWidget(self.steps)
         self.stack = QStackedWidget()
         outer.addWidget(self.stack, 1)
         self.banner = Banner()
         outer.addWidget(self.banner)
         buttons = QHBoxLayout()
         self.back = button("Back", self._back)
+        self.back.setToolTip("The previous step (Alt+Left)")
         self.later = button("Finish later", self.reject)
+        self.later.setToolTip("Close setup. You can carry on from the Face Unlock icon in the "
+                              "notification area.")
         self.next = accent_button("", self._next)
+        self.next.setDefault(True)
+        # Why Continue isn't available yet, said next to it (not only on hover).
+        self.waiting = label("", "Caption")
         buttons.addWidget(self.back)
         buttons.addStretch(1)
+        buttons.addWidget(self.waiting)
         buttons.addWidget(self.later)
         buttons.addWidget(self.next)
         outer.addLayout(buttons)
+        QShortcut(QKeySequence("Alt+Left"), self, activated=lambda: self.back.isVisible()
+                  and self._back())
 
         for page in (self._welcome(), self._ready(), self._password(), self._face(),
                      self._preferences(), self._try()):
-            self.stack.addWidget(page)
+            self.stack.addWidget(VScroll(page))
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         controller.status_changed.connect(self._on_status)
@@ -298,6 +314,10 @@ class OnboardingWizard(QDialog):
                     self.row_start):
             card.body.addWidget(row)
         layout.addWidget(card)
+        peek = Card(padding=(16, 14), spacing=0)
+        self.peek = CameraPeek(self.controller)
+        peek.body.addWidget(self.peek)
+        layout.addWidget(peek)
         layout.addStretch(1)
         return page
 
@@ -321,6 +341,7 @@ class OnboardingWizard(QDialog):
         self.secret.setMinimumWidth(320)
         self.save_button = accent_button("Check and save", self._save_password)
         self.save_button.setEnabled(False)   # until there is something to check
+        self.save_button.setToolTip("Type your password first")
         self.secret.textChanged.connect(self._password_typed)
         layout.addLayout(hbox(self.secret, self.save_button, spacing=8, stretch_at=2))
         layout.addWidget(CapsLockWarning(self.secret))
@@ -331,7 +352,7 @@ class OnboardingWizard(QDialog):
         layout.addLayout(hbox(self.show_secret, forgot, spacing=16, stretch_at=2))
         layout.addWidget(label(PASSWORD_REASON + " If you change your password later, Face "
                                "Unlock will ask for the new one.", "Caption", wrap=True))
-        self.password_state = label("", "Body2", wrap=True)
+        self.password_state = StatusLine()
         layout.addWidget(self.password_state)
         layout.addStretch(1)
         return page
@@ -349,7 +370,7 @@ class OnboardingWizard(QDialog):
             tips.body.addLayout(hbox(GlyphLabel(glyph, 16, tone="accent"),
                                      label(text, "Body"), spacing=10, stretch_at=2))
         layout.addWidget(tips)
-        self.face_state = label("", "Body2", wrap=True)
+        self.face_state = StatusLine()
         self.face_button = accent_button("Start the camera", self._enroll)
         layout.addWidget(self.face_state)
         layout.addLayout(hbox(self.face_button, stretch_at=1))
@@ -400,12 +421,17 @@ class OnboardingWizard(QDialog):
             "Try it",
             "Look at the camera and test recognition. Then lock your PC (Windows+L), step "
             "away for a moment and come back – you'll be signed in as you sit down.")
-        self.test_ring = ProgressRing(20)
-        self.test_ring.hide()
-        self.test_state = label("", "Body2", wrap=True)
-        layout.addLayout(hbox(accent_button("Test recognition", self._test), self.test_ring,
-                              self.test_state, spacing=10, stretch_at=2))
-        layout.addLayout(hbox(button("Lock my PC now", self._lock), stretch_at=1))
+        self.test_button = accent_button("Test recognition", self._test)
+        self.test_button.setToolTip("Looks for you with the camera for a few seconds")
+        self.test_badge = SuccessBadge(32)
+        self.test_badge.hide()
+        self.test_state = StatusLine()
+        test_row = hbox(self.test_button, self.test_badge, spacing=12)
+        test_row.addWidget(self.test_state, 1)
+        layout.addLayout(test_row)
+        lock = button("Lock my PC now", self._lock)
+        lock.setToolTip("Locks Windows straight away, like Windows+L, so you can try signing in")
+        layout.addLayout(hbox(lock, stretch_at=1))
         tips = Card(padding=(18, 14), spacing=8)
         for glyph, text in (
                 (G.FACE, "No need to click anything on the lock screen: just look at the "
@@ -425,12 +451,16 @@ class OnboardingWizard(QDialog):
     # ---- navigation ---------------------------------------------------------------------
 
     def _go(self, index: int) -> None:
+        if self.stack.currentIndex() == 1 and index != 1:
+            self.peek.stop()   # the camera check is only for the Get ready step
+        changed = index != self.stack.currentIndex()
         self.stack.setCurrentIndex(index)
-        for position, item in enumerate(self.step_labels):
-            item.setProperty("role", "Accent" if position == index else "Secondary")
-            item.setStyleSheet("font-weight: 600;" if position == index else "")
+        if changed:
+            fade_in(self.stack.currentWidget())
+        self.steps.set_step(index)
         self.banner.hide()
         self.back.setVisible(index > 0)
+        self.later.setVisible(index < len(STEPS) - 1)
         self.next.setText("Finish" if index == len(STEPS) - 1 else
                           "Get started" if index == 0 else "Continue")
         self.timer.stop()
@@ -476,19 +506,38 @@ class OnboardingWizard(QDialog):
         self._go(index + 1)
 
     def _update_buttons(self) -> None:
+        reason = self.waiting_for()
+        self.next.setEnabled(not reason)
+        self.next.setToolTip(reason)
+        self.waiting.setText(reason)
+
+    def waiting_for(self) -> str:
+        """Why Continue isn't available yet ("" when it is)."""
         index = self.stack.currentIndex()
         status = self.status
-        ready = {
-            0: self.consent.isChecked(),
-            1: self.row_service.ok and self.row_model.ok and self.row_camera.ok,
-            2: bool(status.get("credentials")),
-            3: bool((status.get("profile") or {}).get("anchors")),
-        }.get(index, True)
-        self.next.setEnabled(ready)
+        if index == 0 and not self.consent.isChecked():
+            return "Tick the box above to continue"
+        if index == 1:
+            missing = [name for row, name in ((self.row_service, "the background service"),
+                                              (self.row_model, "the face model"),
+                                              (self.row_camera, "the camera")) if not row.ok]
+            if missing:
+                return "Waiting for " + (", ".join(missing[:-1]) + " and " + missing[-1]
+                                         if len(missing) > 1 else missing[0])
+        if index == 2 and not status.get("credentials"):
+            return "Save your password to continue"
+        if index == 3 and not (status.get("profile") or {}).get("anchors"):
+            return "Set up your face to continue"
+        return ""
 
     def reject(self) -> None:
         self.timer.stop()
+        self.peek.stop()
         super().reject()
+
+    def pause_for_lock(self) -> None:
+        """Windows is locking: the camera check gives the camera back at once."""
+        self.peek.pause_for_lock()
 
     # ---- live state -------------------------------------------------------------------------
 
@@ -497,12 +546,15 @@ class OnboardingWizard(QDialog):
         if index == 1:
             self._refresh_ready()
         elif index == 2:
-            stored = bool(self.status.get("credentials"))
-            self.password_state.setText("✓ Your password is saved." if stored else "")
+            if self.status.get("credentials") and "password" not in self._busy:
+                self.password_state.done("success", "Your password is saved.")
         elif index == 3:
             anchors = (self.status.get("profile") or {}).get("anchors", 0)
-            self.face_state.setText(f"✓ Your face is set up ({anchors} reference photos)."
-                                    if anchors else "")
+            if anchors:
+                self.face_state.done("success",
+                                     f"Your face is set up ({anchors} reference photos).")
+            else:
+                self.face_state.clear()
             self.face_button.setText("Take them again" if anchors else "Start the camera")
         elif index == 5:
             self._refresh_summary()
@@ -605,7 +657,10 @@ class OnboardingWizard(QDialog):
         self._refresh()
 
     def _install_tile(self) -> None:
+        self.row_tile.action.set_busy(True, "Waiting for Windows…")
+
         def done(result) -> None:
+            self.row_tile.action.set_busy(False)
             ok, message = result
             if not ok:
                 self.banner.show_message("caution", "Face sign-in wasn't added", message)
@@ -639,6 +694,7 @@ class OnboardingWizard(QDialog):
 
     def _password_typed(self, text: str) -> None:
         self.save_button.setEnabled(bool(text) and "password" not in self._busy)
+        self.save_button.setToolTip("" if text else "Type your password first")
 
     def _save_password(self) -> None:
         """Checking with Windows can take seconds on work PCs: off the UI thread."""
@@ -647,20 +703,20 @@ class OnboardingWizard(QDialog):
         if not secret or "password" in self._busy:
             return
         self.secret.clear()
-        self.save_button.setEnabled(False)
-        self.save_button.setText("Checking…")
-        self.password_state.setText("Checking with Windows…")
+        self.save_button.set_busy(True, "Checking…")
+        self.password_state.working("Checking your password with Windows…")
 
         def done(result) -> None:
-            self.save_button.setText("Check and save")
+            self.save_button.set_busy(False)
             self._password_typed(self.secret.text())
             ok, problem = result
             if not ok:
-                self.password_state.setText("")
+                self.password_state.done("critical", "Not saved. Type it again below.")
                 self.banner.show_message("critical", "Not saved", problem)
+                self.secret.setFocus()
                 return
             self.banner.hide()
-            self.password_state.setText("✓ Your password is saved.")
+            self.password_state.done("success", "Windows accepted it. Your password is saved.")
             self.controller.client.refresh_status()
 
         self._in_background("password", lambda: store_windows_password(user, domain, secret),
@@ -685,19 +741,23 @@ class OnboardingWizard(QDialog):
             self.banner.show_message("caution", "Some preferences weren't saved", problem)
 
     def _test(self) -> None:
-        self.test_ring.show()
-        self.test_state.setText("Look at the camera…")
+        self.test_button.set_busy(True, "Looking…")
+        self.test_badge.hide()
+        self.test_state.working("Look at the camera…")
 
         def done(reply) -> None:
-            self.test_ring.hide()
+            self.test_button.set_busy(False)
             if not reply or not reply.get("ok"):
-                self.test_state.setText("The test couldn't run: " + str(
+                self.test_state.done("critical", "The test couldn't run: " + str(
                     (reply or {}).get("message") or "Face Unlock isn't responding."))
             elif reply.get("accepted"):
-                self.test_state.setText("✓ Recognised you. You're all set.")
+                self.test_state.done("success", "Recognised you. You're all set!")
+                self.test_state.icon.hide()
+                self.test_badge.show()
+                self.test_badge.play()
             else:
                 from .status import guidance_text
-                self.test_state.setText("Not recognised this time. " + (
+                self.test_state.done("caution", "Not recognised this time. " + (
                     guidance_text(reply.get("guidance")) or "Look straight at the camera and "
                     "try again."))
 
